@@ -23,3 +23,7 @@
 - name: Include browser streaming tasks
   ansible.builtin.include_tasks: browser-stream.yml
   when: browser_stream_enabled | bool
+
+- name: Include VM agent tasks
+  ansible.builtin.include_tasks: vm-agent.yml
+  when: vm_id is defined

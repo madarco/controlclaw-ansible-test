@@ -8,3 +8,9 @@
   ansible.builtin.systemd:
     name: fail2ban
     state: restarted
+
+- name: restart controlclaw-agent
+  ansible.builtin.systemd:
+    name: controlclaw-agent
+    state: restarted
+    daemon_reload: true

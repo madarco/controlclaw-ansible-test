@@ -1,0 +1,111 @@
+---
+# ControlClaw VM Agent - lightweight Node.js server for remote management
+
+- name: Create agent directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: "{{ controlclaw_user }}"
+    group: "{{ controlclaw_user }}"
+    mode: '0750'
+  loop:
+    - /opt/controlclaw/agent
+    - /opt/controlclaw/keys
+
+- name: Write VM private key
+  ansible.builtin.copy:
+    dest: /opt/controlclaw/keys/vm_private_key.pem
+    content: "{{ vm_private_key }}"
+    owner: "{{ controlclaw_user }}"
+    group: "{{ controlclaw_user }}"
+    mode: '0600'
+  when: vm_private_key is defined
+  no_log: true
+
+- name: Write SaaS public key
+  ansible.builtin.copy:
+    dest: /opt/controlclaw/keys/saas_public_key.pem
+    content: "{{ saas_public_key }}"
+    owner: "{{ controlclaw_user }}"
+    group: "{{ controlclaw_user }}"
+    mode: '0644'
+  when: saas_public_key is defined
+
+- name: Write VM ID
+  ansible.builtin.copy:
+    dest: /opt/controlclaw/keys/vm_id
+    content: "{{ vm_id }}"
+    owner: "{{ controlclaw_user }}"
+    group: "{{ controlclaw_user }}"
+    mode: '0644'
+  when: vm_id is defined
+
+- name: Write config API URL
+  ansible.builtin.copy:
+    dest: /opt/controlclaw/keys/config_api_url
+    content: "{{ config_api_url }}"
+    owner: "{{ controlclaw_user }}"
+    group: "{{ controlclaw_user }}"
+    mode: '0644'
+  when: config_api_url is defined
+
+- name: Copy vm-agent package files
+  ansible.builtin.copy:
+    src: vm-agent/
+    dest: /opt/controlclaw/agent/
+    owner: "{{ controlclaw_user }}"
+    group: "{{ controlclaw_user }}"
+    mode: '0644'
+    directory_mode: '0755'
+  notify: restart controlclaw-agent
+
+- name: Install vm-agent production dependencies
+  ansible.builtin.command:
+    cmd: pnpm install --prod
+    chdir: /opt/controlclaw/agent
+  become: true
+  become_user: "{{ controlclaw_user }}"
+  register: pnpm_install
+  changed_when: "'Already up to date' not in pnpm_install.stdout"
+
+- name: Create controlclaw-agent systemd service
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/controlclaw-agent.service
+    owner: root
+    group: root
+    mode: '0644'
+    content: |
+      [Unit]
+      Description=ControlClaw VM Agent
+      After=network.target
+
+      [Service]
+      Type=simple
+      User={{ controlclaw_user }}
+      ExecStart=/usr/bin/node /opt/controlclaw/agent/dist/index.js
+      Restart=always
+      RestartSec=10
+      Environment=HOME={{ controlclaw_home }}
+      Environment=KEYS_DIR=/opt/controlclaw/keys
+      Environment=AGENT_PORT=3100
+
+      [Install]
+      WantedBy=multi-user.target
+  notify: restart controlclaw-agent
+
+- name: Allow agent port 3100 in UFW
+  community.general.ufw:
+    rule: allow
+    port: '3100'
+    proto: tcp
+    comment: 'ControlClaw Agent'
+
+- name: Reload systemd daemon
+  ansible.builtin.systemd:
+    daemon_reload: true
+
+- name: Enable and start controlclaw-agent service
+  ansible.builtin.systemd:
+    name: controlclaw-agent
+    state: started
+    enabled: true
