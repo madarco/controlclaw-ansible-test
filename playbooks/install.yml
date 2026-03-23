@@ -1,0 +1,83 @@
+---
+- name: Provision ControlClaw VM with Docker, Node.js, and security hardening
+  hosts: localhost
+  connection: local
+  become: true
+
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+
+  environment:
+    TERM: xterm-256color
+    COLORTERM: truecolor
+
+  pre_tasks:
+    - name: Enable color terminal for current session
+      ansible.builtin.set_fact:
+        ansible_env: "{{ ansible_env | combine({'TERM': 'xterm-256color', 'COLORTERM': 'truecolor'}) }}"
+
+    - name: Detect operating system
+      ansible.builtin.set_fact:
+        is_linux: "{{ ansible_system == 'Linux' }}"
+        is_debian_family: "{{ ansible_os_family == 'Debian' }}"
+        is_supported_distro: "{{ ansible_distribution in ['Debian', 'Ubuntu'] }}"
+
+    - name: Fail on unsupported non-Linux systems
+      ansible.builtin.fail:
+        msg: >-
+          Unsupported operating system: {{ ansible_system }}.
+          This installer supports Linux only.
+      when: not is_linux
+
+    - name: Fail on unsupported Linux distribution
+      ansible.builtin.fail:
+        msg: >-
+          Unsupported Linux distribution: {{ ansible_distribution }} {{ ansible_distribution_version }}.
+          This installer currently supports Debian and Ubuntu.
+      when:
+        - is_linux
+        - not is_supported_distro
+
+    - name: Display detected OS
+      ansible.builtin.debug:
+        msg: |
+          Detected OS: {{ ansible_distribution }} {{ ansible_distribution_version }}
+          OS Family: {{ ansible_os_family }}
+
+    - name: Update apt cache and upgrade all packages
+      ansible.builtin.apt:
+        update_cache: true
+        upgrade: dist
+        cache_valid_time: 3600
+      when: is_debian_family and not ci_test
+      register: apt_upgrade_result
+
+    - name: Install ACL for privilege escalation
+      ansible.builtin.package:
+        name: acl
+        state: present
+      when: is_supported_distro
+
+    - name: Check if running as root
+      ansible.builtin.command: id -u
+      register: user_id
+      changed_when: false
+      become: false
+
+    - name: Set fact for root user
+      ansible.builtin.set_fact:
+        is_root: "{{ user_id.stdout == '0' }}"
+
+  roles:
+    - controlclaw
+
+  post_tasks:
+    - name: Create cloud-init completion marker
+      ansible.builtin.file:
+        path: /root/cloud-init-done
+        state: touch
+        mode: '0644'
+
+    - name: Provisioning complete
+      ansible.builtin.debug:
+        msg: "ControlClaw VM provisioning complete!"

@@ -1,0 +1,85 @@
+---
+# Optional: Chromium browser streaming with noVNC
+
+- name: Install browser streaming dependencies
+  ansible.builtin.apt:
+    name:
+      - xvfb
+      - x11vnc
+      - novnc
+      - websockify
+      - fonts-liberation
+      - fonts-noto-color-emoji
+      - socat
+      - python3
+    state: present
+    update_cache: true
+
+- name: Download Google Chrome stable
+  ansible.builtin.shell:
+    cmd: |
+      set -o pipefail
+      curl -fsSL https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb -o /tmp/google-chrome.deb
+    creates: /usr/bin/google-chrome-stable
+    executable: /bin/bash
+
+- name: Install Google Chrome stable
+  ansible.builtin.apt:
+    deb: /tmp/google-chrome.deb
+  when: not ansible_check_mode
+
+- name: Fix Chrome dependencies if needed
+  ansible.builtin.apt:
+    state: present
+    update_cache: true
+  register: chrome_deps
+  failed_when: false
+
+- name: Clean up Chrome installer
+  ansible.builtin.file:
+    path: /tmp/google-chrome.deb
+    state: absent
+
+- name: Deploy browser-stream script
+  ansible.builtin.copy:
+    src: browser-stream.sh
+    dest: /usr/local/bin/browser-stream.sh
+    owner: root
+    group: root
+    mode: '0755'
+
+- name: Create browser-stream systemd service
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/browser-stream.service
+    owner: root
+    group: root
+    mode: '0644'
+    content: |
+      [Unit]
+      Description=Browser Streaming (Chromium + noVNC)
+      After=network.target
+
+      [Service]
+      Type=simple
+      User={{ controlclaw_user }}
+      ExecStart=/usr/local/bin/browser-stream.sh
+      Restart=always
+      RestartSec=10
+      Environment=HOME={{ controlclaw_home }}
+      Environment=DISPLAY=:1
+      Environment=CONTROLCLAW_BROWSER_CDP_PORT={{ browser_cdp_port }}
+      Environment=CONTROLCLAW_BROWSER_VNC_PORT={{ browser_vnc_port }}
+      Environment=CONTROLCLAW_BROWSER_NOVNC_PORT={{ browser_novnc_port }}
+
+      [Install]
+      WantedBy=multi-user.target
+
+- name: Reload systemd daemon
+  ansible.builtin.systemd:
+    daemon_reload: true
+
+- name: Enable and start browser-stream service
+  ansible.builtin.systemd:
+    name: browser-stream
+    state: started
+    enabled: true

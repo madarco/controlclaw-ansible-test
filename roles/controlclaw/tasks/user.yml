@@ -1,0 +1,152 @@
+---
+- name: Create controlclaw system user
+  ansible.builtin.user:
+    name: "{{ controlclaw_user }}"
+    comment: "ControlClaw Service User"
+    system: true
+    shell: /bin/bash
+    create_home: true
+    home: "{{ controlclaw_home }}"
+    state: present
+
+- name: Ensure controlclaw home directory has correct ownership
+  ansible.builtin.file:
+    path: "{{ controlclaw_home }}"
+    owner: "{{ controlclaw_user }}"
+    group: "{{ controlclaw_user }}"
+    state: directory
+    mode: '0755'
+
+- name: Configure .bashrc for controlclaw user
+  ansible.builtin.blockinfile:
+    path: "{{ controlclaw_home }}/.bashrc"
+    marker: "# {mark} ANSIBLE MANAGED BLOCK - ControlClaw config"
+    block: |
+      # Enable 256 colors
+      export TERM=xterm-256color
+      export COLORTERM=truecolor
+
+      # Add pnpm to PATH
+      export PNPM_HOME="{{ controlclaw_home }}/.local/share/pnpm"
+      export PATH="{{ controlclaw_home }}/.local/bin:$PNPM_HOME:$PATH"
+
+      # Color support for common tools
+      export CLICOLOR=1
+      export LS_COLORS='di=34:ln=35:so=32:pi=33:ex=31:bd=34;46:cd=34;43:su=30;41:sg=30;46:tw=30;42:ow=30;43'
+
+      # Aliases
+      alias ls='ls --color=auto'
+      alias grep='grep --color=auto'
+      alias ll='ls -lah'
+    create: true
+    owner: "{{ controlclaw_user }}"
+    group: "{{ controlclaw_user }}"
+    mode: '0644'
+
+- name: Add controlclaw user to sudoers with scoped NOPASSWD
+  ansible.builtin.copy:
+    dest: "/etc/sudoers.d/{{ controlclaw_user }}"
+    mode: '0440'
+    owner: root
+    group: root
+    content: |
+      # ControlClaw sudo permissions (scoped for security)
+
+      # Service control - controlclaw service only
+      {{ controlclaw_user }} ALL=(ALL) NOPASSWD: /usr/bin/systemctl start controlclaw
+      {{ controlclaw_user }} ALL=(ALL) NOPASSWD: /usr/bin/systemctl stop controlclaw
+      {{ controlclaw_user }} ALL=(ALL) NOPASSWD: /usr/bin/systemctl restart controlclaw
+      {{ controlclaw_user }} ALL=(ALL) NOPASSWD: /usr/bin/systemctl status controlclaw
+      {{ controlclaw_user }} ALL=(ALL) NOPASSWD: /usr/bin/systemctl enable controlclaw
+      {{ controlclaw_user }} ALL=(ALL) NOPASSWD: /usr/bin/systemctl disable controlclaw
+      {{ controlclaw_user }} ALL=(ALL) NOPASSWD: /usr/bin/systemctl daemon-reload
+
+      # Tailscale - diagnostics + connect/disconnect
+      {{ controlclaw_user }} ALL=(ALL) NOPASSWD: /usr/bin/tailscale status
+      {{ controlclaw_user }} ALL=(ALL) NOPASSWD: /usr/bin/tailscale up *
+      {{ controlclaw_user }} ALL=(ALL) NOPASSWD: /usr/bin/tailscale down
+      {{ controlclaw_user }} ALL=(ALL) NOPASSWD: /usr/bin/tailscale ip *
+      {{ controlclaw_user }} ALL=(ALL) NOPASSWD: /usr/bin/tailscale version
+      {{ controlclaw_user }} ALL=(ALL) NOPASSWD: /usr/bin/tailscale ping *
+      {{ controlclaw_user }} ALL=(ALL) NOPASSWD: /usr/bin/tailscale whois *
+
+      # Journal access - controlclaw logs only
+      {{ controlclaw_user }} ALL=(ALL) NOPASSWD: /usr/bin/journalctl -u controlclaw *
+    validate: /usr/sbin/visudo -cf %s
+
+- name: Create .bash_profile to source .bashrc for login shells
+  ansible.builtin.copy:
+    dest: "{{ controlclaw_home }}/.bash_profile"
+    owner: "{{ controlclaw_user }}"
+    group: "{{ controlclaw_user }}"
+    mode: '0644'
+    content: |
+      # .bash_profile - Executed for login shells
+      # Source .bashrc to ensure environment is loaded for login shells
+      if [ -f ~/.bashrc ]; then
+          . ~/.bashrc
+      fi
+
+# Fix DBus issues for systemd user services
+- name: Get controlclaw user ID
+  ansible.builtin.command: "id -u {{ controlclaw_user }}"
+  register: controlclaw_uid
+  changed_when: false
+  when: ansible_os_family == 'Debian' and not ci_test
+
+- name: Enable lingering for controlclaw user (allows systemd user services without login)
+  ansible.builtin.command: "loginctl enable-linger {{ controlclaw_user }}"
+  changed_when: false
+  when: ansible_os_family == 'Debian' and not ci_test
+
+- name: Create runtime directory for controlclaw user
+  ansible.builtin.file:
+    path: "/run/user/{{ controlclaw_uid.stdout }}"
+    state: directory
+    owner: "{{ controlclaw_user }}"
+    group: "{{ controlclaw_user }}"
+    mode: '0700'
+  when: ansible_os_family == 'Debian' and not ci_test
+
+# SSH key configuration
+- name: Create .ssh directory for controlclaw user
+  ansible.builtin.file:
+    path: "{{ controlclaw_home }}/.ssh"
+    state: directory
+    owner: "{{ controlclaw_user }}"
+    group: "{{ controlclaw_user }}"
+    mode: '0700'
+
+- name: Add SSH authorized keys for controlclaw user
+  ansible.posix.authorized_key:
+    user: "{{ controlclaw_user }}"
+    state: present
+    key: "{{ item }}"
+  loop: "{{ controlclaw_ssh_keys }}"
+  when: controlclaw_ssh_keys | length > 0
+
+- name: Set XDG_RUNTIME_DIR in .bashrc for controlclaw user
+  ansible.builtin.lineinfile:
+    path: "{{ controlclaw_home }}/.bashrc"
+    line: 'export XDG_RUNTIME_DIR=/run/user/$(id -u)'
+    state: present
+    create: true
+    owner: "{{ controlclaw_user }}"
+    group: "{{ controlclaw_user }}"
+    mode: '0644'
+  when: ansible_os_family == 'Debian' and not ci_test
+
+- name: Set DBUS_SESSION_BUS_ADDRESS in .bashrc for controlclaw user
+  ansible.builtin.blockinfile:
+    path: "{{ controlclaw_home }}/.bashrc"
+    marker: "# {mark} ANSIBLE MANAGED BLOCK - DBus config"
+    block: |
+      # DBus session bus configuration
+      if [ -z "$DBUS_SESSION_BUS_ADDRESS" ]; then
+        export DBUS_SESSION_BUS_ADDRESS="unix:path=${XDG_RUNTIME_DIR}/bus"
+      fi
+    create: true
+    owner: "{{ controlclaw_user }}"
+    group: "{{ controlclaw_user }}"
+    mode: '0644'
+  when: ansible_os_family == 'Debian' and not ci_test

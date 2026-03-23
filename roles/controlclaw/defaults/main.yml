@@ -1,0 +1,25 @@
+---
+# ControlClaw default variables
+
+# CI testing mode - skips tasks that require systemd, Docker-in-Docker, or kernel access
+ci_test: false
+
+# Tailscale settings
+tailscale_enabled: false
+tailscale_authkey: ""
+
+# Node.js version
+nodejs_version: "22.x"
+
+# User settings (will be created as system user)
+controlclaw_user: controlclaw
+controlclaw_home: /home/controlclaw
+
+# SSH keys for controlclaw user
+controlclaw_ssh_keys: []
+
+# Browser streaming (Chromium + noVNC)
+browser_stream_enabled: false
+browser_cdp_port: 9222
+browser_vnc_port: 5900
+browser_novnc_port: 6080
