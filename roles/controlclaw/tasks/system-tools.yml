@@ -6,10 +6,10 @@
 
 # Common tasks for all operating systems
 
-- name: Configure git globally
+- name: Configure git system-wide
   community.general.git_config:
     name: "{{ item.name }}"
-    scope: global
+    scope: system
     value: "{{ item.value }}"
   loop:
     - { name: 'init.defaultBranch', value: 'main' }
