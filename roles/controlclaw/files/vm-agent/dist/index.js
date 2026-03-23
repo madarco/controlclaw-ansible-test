@@ -3,24 +3,26 @@ import { createServer } from "http";
 import { readFileSync } from "fs";
 
 // src/auth.ts
-import jwt from "jsonwebtoken";
+import { importSPKI, jwtVerify } from "jose";
 var saasPublicKey = null;
 function setSaasPublicKey(key) {
   saasPublicKey = key;
 }
-function verifyRequest(req) {
+async function verifyRequest(req) {
   if (!saasPublicKey) return null;
   const authHeader = req.headers.authorization;
   if (!authHeader?.startsWith("Bearer ")) return null;
   const token = authHeader.slice(7);
   try {
-    return jwt.verify(token, saasPublicKey, { algorithms: ["EdDSA"] });
+    const key = await importSPKI(saasPublicKey, "EdDSA");
+    const { payload } = await jwtVerify(token, key, { algorithms: ["EdDSA"] });
+    return payload;
   } catch {
     return null;
   }
 }
-function requireAuth(req, res) {
-  const payload = verifyRequest(req);
+async function requireAuth(req, res) {
+  const payload = await verifyRequest(req);
   if (!payload) {
     res.writeHead(401, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ error: "Unauthorized" }));
@@ -78,9 +80,9 @@ try {
   console.error("Failed to load SaaS public key:", err);
   process.exit(1);
 }
-var server = createServer((req, res) => {
+var server = createServer(async (req, res) => {
   const url = new URL(req.url ?? "/", `http://localhost:${PORT}`);
-  if (!requireAuth(req, res)) return;
+  if (!await requireAuth(req, res)) return;
   if (url.pathname === "/health" && req.method === "GET") {
     handleHealth(res);
     return;
