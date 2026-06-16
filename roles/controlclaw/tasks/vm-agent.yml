@@ -49,6 +49,15 @@
     mode: '0644'
   when: config_api_url is defined
 
+- name: Write ready API URL
+  ansible.builtin.copy:
+    dest: /opt/controlclaw/keys/ready_api_url
+    content: "{{ ready_api_url }}"
+    owner: "{{ controlclaw_user }}"
+    group: "{{ controlclaw_user }}"
+    mode: '0644'
+  when: ready_api_url is defined
+
 - name: Copy vm-agent package files
   ansible.builtin.copy:
     src: vm-agent/
