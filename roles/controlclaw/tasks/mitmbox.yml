@@ -16,9 +16,12 @@
   when: not ci_test
 
 - name: Install mitmproxy (pipx, pinned)
+  # Pin via `source` (foo==x.y.z): the `version` param only exists in newer
+  # community.general; `source` works across the collection versions ansible-galaxy
+  # resolves on a fresh box. `name` is still used for idempotency/state tracking.
   community.general.pipx:
     name: mitmproxy
-    version: "12.2.2"
+    source: mitmproxy==12.2.2
     state: present
   when: not ci_test
 
