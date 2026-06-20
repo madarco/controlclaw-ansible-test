@@ -4,25 +4,32 @@
 # sole internet gateway for the org's OpenClaw box(es). See
 # controlclaw/docs/plans/mitm-box-security-rollout.md.
 
-- name: Install mitmproxy via pipx
+# Install mitmproxy into a dedicated venv at a FIXED path. This avoids pipx entirely:
+# Ubuntu 24.04's apt pipx (1.4.3) is too old for the community.general pipx module's
+# `source=` (needs >=1.7.0), and pipx's per-user bin dir made the service binary path
+# ambiguous. A venv is version-independent and the service points straight at it.
+- name: Install python venv + pip tooling
   ansible.builtin.apt:
-    name: [pipx]
+    name: [python3-venv, python3-pip]
     state: present
   when: not ci_test
 
-- name: Ensure pipx path
-  ansible.builtin.command: pipx ensurepath
-  changed_when: false
+- name: Ensure mitm base dir exists (for the venv)
+  ansible.builtin.file:
+    path: /opt/controlclaw/mitm
+    state: directory
+    mode: '0755'
+
+- name: Create the mitmproxy venv
+  ansible.builtin.command:
+    cmd: python3 -m venv /opt/controlclaw/mitm/venv
+    creates: /opt/controlclaw/mitm/venv/bin/pip
   when: not ci_test
 
-- name: Install mitmproxy (pipx, pinned)
-  # Pin via `source` (foo==x.y.z): the `version` param only exists in newer
-  # community.general; `source` works across the collection versions ansible-galaxy
-  # resolves on a fresh box. `name` is still used for idempotency/state tracking.
-  community.general.pipx:
-    name: mitmproxy
-    source: mitmproxy==12.2.2
-    state: present
+- name: Install mitmproxy (pinned) into the venv
+  ansible.builtin.pip:
+    name: mitmproxy==12.2.2
+    virtualenv: /opt/controlclaw/mitm/venv
   when: not ci_test
 
 - name: Create mitm directories
@@ -136,7 +143,7 @@
       Environment=MITM_PENDING_PATH=/run/mitm/config/pending.jsonl
       Environment=MITM_LOG_FILE=/opt/controlclaw/mitm/traffic.jsonl
       Environment=MITM_TENANT={{ org_id | default('unknown') }}
-      ExecStart=/usr/bin/mitmdump --listen-port {{ mitm_proxy_port }} \
+      ExecStart=/opt/controlclaw/mitm/venv/bin/mitmdump --listen-port {{ mitm_proxy_port }} \
         --set confdir=/opt/controlclaw/mitm/ca -s /opt/controlclaw/mitm/proxy/addon.py
       Restart=always
       RestartSec=5
