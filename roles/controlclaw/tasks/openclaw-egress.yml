@@ -28,6 +28,16 @@
       export NO_PROXY="localhost,127.0.0.1,{{ mitm_box_private_ip }}"
   when: mitm_box_private_ip is defined and mitm_box_private_ip | length > 0
 
+- name: Ensure the openclaw systemd drop-in dir exists
+  # `copy` won't create the parent dir, and openclaw.service may not be installed yet
+  # (it's a separate product). A drop-in dir for an absent unit is harmless — systemd
+  # ignores it — but it must exist for the drop-in copy below to succeed.
+  ansible.builtin.file:
+    path: /etc/systemd/system/openclaw.service.d
+    state: directory
+    mode: '0755'
+  when: mitm_box_private_ip is defined and mitm_box_private_ip | length > 0
+
 - name: Set proxy for the openclaw systemd service
   ansible.builtin.copy:
     dest: /etc/systemd/system/openclaw.service.d/egress-proxy.conf
