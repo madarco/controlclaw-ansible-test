@@ -1,0 +1,58 @@
+---
+# OpenClaw box egress wiring: trust the mitm box's CA (so the proxy can inspect HTTPS),
+# route outbound traffic through the mitm box, and install the cc-perm CLI for the
+# human-in-the-loop permission flow. Egress is ENFORCED at the Hetzner firewall (the box
+# can only reach the mitm box's private IP); this only configures the client side.
+
+# The CA is passed in by createVm (read from the org mitm box's published cert). If the mitm
+# box hasn't published yet when the FIRST OpenClaw box provisions, the vm-agent installs it on a
+# later config sync (config endpoint returns mitm.caCert) — see docs/plans/part-ca-handoff.md.
+- name: Install the mitm CA into the trust store
+  ansible.builtin.copy:
+    dest: /usr/local/share/ca-certificates/controlclaw-mitm.crt
+    content: "{{ mitm_ca_cert }}"
+    mode: '0644'
+  when: (mitm_ca_cert | default('')) | length > 0
+  notify: update ca certificates
+
+- name: Route outbound HTTP(S) through the mitm box
+  ansible.builtin.copy:
+    dest: /etc/profile.d/controlclaw-egress.sh
+    mode: '0644'
+    content: |
+      # Forced egress via the org mitm box (the box can only reach this IP anyway).
+      export HTTP_PROXY="http://{{ mitm_box_private_ip }}:{{ mitm_proxy_port }}"
+      export HTTPS_PROXY="http://{{ mitm_box_private_ip }}:{{ mitm_proxy_port }}"
+      export http_proxy="$HTTP_PROXY"
+      export https_proxy="$HTTPS_PROXY"
+      export NO_PROXY="localhost,127.0.0.1,{{ mitm_box_private_ip }}"
+  when: mitm_box_private_ip is defined and mitm_box_private_ip | length > 0
+
+- name: Set proxy for the openclaw systemd service
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/openclaw.service.d/egress-proxy.conf
+    mode: '0644'
+    content: |
+      [Service]
+      Environment=HTTP_PROXY=http://{{ mitm_box_private_ip }}:{{ mitm_proxy_port }}
+      Environment=HTTPS_PROXY=http://{{ mitm_box_private_ip }}:{{ mitm_proxy_port }}
+      Environment=NO_PROXY=localhost,127.0.0.1
+  when: mitm_box_private_ip is defined and mitm_box_private_ip | length > 0
+  notify: reload systemd
+
+- name: Deploy cc-perm CLI (self-contained bundle)
+  ansible.builtin.copy:
+    src: cc-perm/
+    dest: /opt/controlclaw/cc-perm/
+    owner: "{{ controlclaw_user }}"
+    group: "{{ controlclaw_user }}"
+    mode: '0644'
+    directory_mode: '0755'
+
+- name: Link cc-perm into PATH
+  ansible.builtin.copy:
+    dest: /usr/local/bin/cc-perm
+    mode: '0755'
+    content: |
+      #!/bin/sh
+      exec /usr/bin/node /opt/controlclaw/cc-perm/dist/index.js "$@"

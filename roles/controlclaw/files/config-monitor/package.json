@@ -1,0 +1,17 @@
+{
+  "name": "@controlclaw/config-monitor",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsup src/index.ts --format esm --target node22 --clean",
+    "test": "tsx --test test/*.test.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsup": "^8.0.0",
+    "tsx": "^4.0.0",
+    "typescript": "^5.0.0"
+  }
+}

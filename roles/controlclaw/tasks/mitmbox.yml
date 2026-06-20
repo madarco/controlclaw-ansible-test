@@ -1,0 +1,208 @@
+---
+# ControlClaw mitm box (the "secret zone"): mitmproxy egress filter + credential swap,
+# the mitm-agent (box key + encrypted-store sync), an on-box CA, and NAT so it is the
+# sole internet gateway for the org's OpenClaw box(es). See
+# controlclaw/docs/plans/mitm-box-security-rollout.md.
+
+- name: Install mitmproxy via pipx
+  ansible.builtin.apt:
+    name: [pipx]
+    state: present
+  when: not ci_test
+
+- name: Ensure pipx path
+  ansible.builtin.command: pipx ensurepath
+  changed_when: false
+  when: not ci_test
+
+- name: Install mitmproxy (pipx, pinned)
+  community.general.pipx:
+    name: mitmproxy
+    version: "12.2.2"
+    state: present
+  when: not ci_test
+
+- name: Create mitm directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: "{{ controlclaw_user }}"
+    group: "{{ controlclaw_user }}"
+    mode: '0750'
+  loop:
+    - /opt/controlclaw/keys
+    - /opt/controlclaw/mitm/agent
+    - /opt/controlclaw/mitm/proxy
+    - /opt/controlclaw/mitm/ca
+
+# Secrets the proxy reads are RAM-only: mount the proxy config dir as tmpfs so decrypted
+# credentials never touch the disk.
+- name: Mount tmpfs for proxy runtime config (RAM-only secrets)
+  ansible.posix.mount:
+    path: /run/mitm/config
+    src: tmpfs
+    fstype: tmpfs
+    opts: "rw,nosuid,nodev,mode=0700,uid={{ controlclaw_user }},size=16m"
+    state: mounted
+  when: not ci_test
+
+# --- box keys (control + outbound box-JWT auth, same as the vm-agent) ---
+- name: Write mitm box keys
+  ansible.builtin.copy:
+    dest: "/opt/controlclaw/keys/{{ item.name }}"
+    content: "{{ item.content }}"
+    owner: "{{ controlclaw_user }}"
+    group: "{{ controlclaw_user }}"
+    mode: "{{ item.mode }}"
+  loop:
+    - { name: vm_private_key.pem, content: "{{ vm_private_key | default('') }}", mode: '0600' }
+    - { name: saas_public_key.pem, content: "{{ saas_public_key | default('') }}", mode: '0644' }
+    - { name: vm_id, content: "{{ vm_id | default('') }}", mode: '0644' }
+    - { name: ready_api_url, content: "{{ ready_api_url | default('') }}", mode: '0644' }
+  no_log: true
+  when: vm_id is defined
+
+# --- CA: generate on the box; private key stays here, public cert is exported for the
+#     OpenClaw box trust store. (v1 single CA; offline-root/intermediate is hardening.) ---
+- name: Deploy CA generator
+  ansible.builtin.copy:
+    src: mitm-proxy/gen-ca.sh
+    dest: /opt/controlclaw/mitm/gen-ca.sh
+    mode: '0755'
+
+- name: Generate the egress CA (idempotent)
+  ansible.builtin.command:
+    cmd: bash /opt/controlclaw/mitm/gen-ca.sh /opt/controlclaw/mitm/ca
+    creates: /opt/controlclaw/mitm/ca/mitmproxy-ca.pem
+
+# --- proxy addon + mitm-agent code ---
+- name: Deploy mitmproxy addon
+  ansible.builtin.copy:
+    src: mitm-proxy/addon.py
+    dest: /opt/controlclaw/mitm/proxy/addon.py
+    mode: '0644'
+  notify: restart controlclaw-mitmproxy
+
+- name: Deploy mitm-agent (self-contained bundle — no node_modules needed)
+  ansible.builtin.copy:
+    src: mitm-agent/
+    dest: /opt/controlclaw/mitm/agent/
+    owner: "{{ controlclaw_user }}"
+    group: "{{ controlclaw_user }}"
+    mode: '0644'
+    directory_mode: '0755'
+  notify: restart controlclaw-mitm-agent
+
+# --- NAT: this box is the only internet egress for the private network ---
+- name: Enable IPv4 forwarding
+  ansible.posix.sysctl:
+    name: net.ipv4.ip_forward
+    value: '1'
+    sysctl_set: true
+    state: present
+    reload: true
+  when: not ci_test
+
+- name: Masquerade private-net egress out the public interface
+  ansible.builtin.shell: >-
+    nft list table ip controlclaw_nat >/dev/null 2>&1 ||
+    (nft add table ip controlclaw_nat &&
+     nft 'add chain ip controlclaw_nat postrouting { type nat hook postrouting priority 100 ; }' &&
+     nft add rule ip controlclaw_nat postrouting ip saddr {{ mitm_private_subnet }} oifname "{{ mitm_public_iface }}" masquerade)
+  args:
+    executable: /bin/bash
+  changed_when: true
+  when: not ci_test
+
+# --- systemd services ---
+- name: Create controlclaw-mitmproxy service
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/controlclaw-mitmproxy.service
+    mode: '0644'
+    content: |
+      [Unit]
+      Description=ControlClaw mitm egress proxy
+      After=network.target
+
+      [Service]
+      Type=simple
+      User={{ controlclaw_user }}
+      Environment=MITM_RULES_PATH=/run/mitm/config/rules.json
+      Environment=MITM_CREDENTIALS_PATH=/run/mitm/config/credentials.json
+      Environment=MITM_GRANTS_PATH=/run/mitm/config/grants.json
+      Environment=MITM_PENDING_PATH=/run/mitm/config/pending.jsonl
+      Environment=MITM_LOG_FILE=/opt/controlclaw/mitm/traffic.jsonl
+      Environment=MITM_TENANT={{ org_id | default('unknown') }}
+      ExecStart=/usr/bin/mitmdump --listen-port {{ mitm_proxy_port }} \
+        --set confdir=/opt/controlclaw/mitm/ca -s /opt/controlclaw/mitm/proxy/addon.py
+      Restart=always
+      RestartSec=5
+
+      [Install]
+      WantedBy=multi-user.target
+  notify: restart controlclaw-mitmproxy
+
+- name: Create controlclaw-mitm-agent service
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/controlclaw-mitm-agent.service
+    mode: '0644'
+    content: |
+      [Unit]
+      Description=ControlClaw mitm agent (store sync + permission bridge)
+      After=network.target
+
+      [Service]
+      Type=simple
+      User={{ controlclaw_user }}
+      Environment=HOME={{ controlclaw_home }}
+      Environment=KEYS_DIR=/opt/controlclaw/keys
+      Environment=BOX_KEY_PATH=/opt/controlclaw/keys/box_key
+      Environment=AGENT_PORT={{ mitm_agent_port }}
+      Environment=ORG_ID={{ org_id | default('') }}
+      Environment=BOX_ID={{ vm_id | default('') }}
+      Environment=PROXY_CONFIG_DIR=/run/mitm/config
+      Environment=STORE_URL={{ controlclaw_url }}/api/vm-agent/store
+      Environment=RULES_URL={{ controlclaw_url }}/api/vm-agent/egress-rules
+      Environment=PERMISSION_URL={{ controlclaw_url }}/api/vm-agent/permission
+      Environment=PENDING_PATH=/run/mitm/config/pending.jsonl
+      Environment=GRANTS_PATH=/run/mitm/config/grants.json
+      Environment=CA_CERT_PATH=/opt/controlclaw/mitm/ca/ca-cert.pem
+      Environment=CA_URL={{ controlclaw_url }}/api/vm-agent/ca
+      ExecStart=/usr/bin/node /opt/controlclaw/mitm/agent/dist/index.js
+      Restart=always
+      RestartSec=10
+
+      [Install]
+      WantedBy=multi-user.target
+  notify: restart controlclaw-mitm-agent
+
+- name: Allow proxy port from the private network only
+  community.general.ufw:
+    rule: allow
+    port: "{{ mitm_proxy_port }}"
+    proto: tcp
+    src: "{{ mitm_private_subnet }}"
+    comment: 'ControlClaw mitm proxy (private net)'
+  when: not ci_test
+
+- name: Allow mitm-agent control port in UFW
+  community.general.ufw:
+    rule: allow
+    port: "{{ mitm_agent_port }}"
+    proto: tcp
+    comment: 'ControlClaw mitm agent'
+  when: not ci_test
+
+- name: Reload systemd
+  ansible.builtin.systemd:
+    daemon_reload: true
+
+- name: Enable and start mitm services
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    state: started
+    enabled: true
+  loop:
+    - controlclaw-mitmproxy
+    - controlclaw-mitm-agent
+  when: not ci_test

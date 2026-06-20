@@ -24,6 +24,16 @@
   ansible.builtin.include_tasks: browser-stream.yml
   when: browser_stream_enabled | bool
 
-- name: Include VM agent tasks
+- name: Include VM agent tasks (OpenClaw box)
   ansible.builtin.include_tasks: vm-agent.yml
-  when: vm_id is defined
+  when: vm_id is defined and box_role != 'mitm'
+
+- name: Include OpenClaw egress wiring (route through the org mitm box)
+  ansible.builtin.include_tasks: openclaw-egress.yml
+  when:
+    - box_role != 'mitm'
+    - mitm_box_private_ip | default('') | length > 0
+
+- name: Include mitm box tasks (secret zone)
+  ansible.builtin.include_tasks: mitmbox.yml
+  when: box_role == 'mitm'
