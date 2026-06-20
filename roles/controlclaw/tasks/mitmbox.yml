@@ -85,6 +85,17 @@
     cmd: bash /opt/controlclaw/mitm/gen-ca.sh /opt/controlclaw/mitm/ca
     creates: /opt/controlclaw/mitm/ca/mitmproxy-ca.pem
 
+# gen-ca.sh runs as root, so the CA bundle lands root:root 0600 — but the proxy runs
+# as controlclaw_user and must read mitmproxy-ca.pem (the key+cert signing bundle).
+# Hand the whole confdir to the proxy user (it also writes derived cert files there).
+- name: Make the CA confdir readable/writable by the proxy user
+  ansible.builtin.file:
+    path: /opt/controlclaw/mitm/ca
+    state: directory
+    owner: "{{ controlclaw_user }}"
+    group: "{{ controlclaw_user }}"
+    recurse: true
+
 # --- proxy addon + mitm-agent code ---
 - name: Deploy mitmproxy addon
   ansible.builtin.copy:
