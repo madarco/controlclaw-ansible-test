@@ -58,6 +58,28 @@
     mode: '0644'
   when: ready_api_url is defined
 
+# On-box keygen (secured boxes): instead of a shipped private key, the agent generates its OWN
+# keypair and registers the public key using this one-time bootstrap token. Legacy boxes get
+# vm_private_key.pem above and no token (the agent then skips registration).
+- name: Write bootstrap token (one-time pubkey registration)
+  ansible.builtin.copy:
+    dest: /opt/controlclaw/keys/bootstrap_token
+    content: "{{ vm_bootstrap_token }}"
+    owner: "{{ controlclaw_user }}"
+    group: "{{ controlclaw_user }}"
+    mode: '0600'
+  when: vm_bootstrap_token is defined and vm_bootstrap_token | length > 0
+  no_log: true
+
+- name: Write register API URL
+  ansible.builtin.copy:
+    dest: /opt/controlclaw/keys/register_api_url
+    content: "{{ register_api_url }}"
+    owner: "{{ controlclaw_user }}"
+    group: "{{ controlclaw_user }}"
+    mode: '0644'
+  when: register_api_url is defined and register_api_url | length > 0
+
 - name: Copy vm-agent package files
   ansible.builtin.copy:
     src: vm-agent/

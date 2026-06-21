@@ -1,6 +1,6 @@
 // src/index.ts
 import { createServer } from "http";
-import { readFileSync as readFileSync6, writeFileSync as writeFileSync5 } from "fs";
+import { readFileSync as readFileSync7, writeFileSync as writeFileSync6 } from "fs";
 
 // ../secret-store/dist/index.js
 import { randomBytes, createCipheriv, createDecipheriv } from "crypto";
@@ -729,18 +729,89 @@ function loadOrCreateBoxKey(path) {
   return key;
 }
 
+// src/keys.ts
+import crypto2 from "crypto";
+import { readFileSync as readFileSync2, writeFileSync as writeFileSync2, existsSync as existsSync2, mkdirSync as mkdirSync2 } from "fs";
+function readFile(path) {
+  try {
+    return readFileSync2(path, "utf8").trim();
+  } catch {
+    return null;
+  }
+}
+function ensureVmKeypair(keysDir) {
+  const privPath = `${keysDir}/vm_private_key.pem`;
+  const pubPath = `${keysDir}/vm_public_key.pem`;
+  if (existsSync2(privPath)) {
+    return readFile(pubPath) ?? derivePublicKey(readFileSync2(privPath, "utf8"));
+  }
+  const { publicKey, privateKey } = crypto2.generateKeyPairSync("ed25519", {
+    publicKeyEncoding: { type: "spki", format: "pem" },
+    privateKeyEncoding: { type: "pkcs8", format: "pem" }
+  });
+  mkdirSync2(keysDir, { recursive: true });
+  writeFileSync2(privPath, privateKey, { mode: 384 });
+  writeFileSync2(pubPath, publicKey, { mode: 420 });
+  console.log("[keys] generated on-box vm keypair");
+  return publicKey;
+}
+function derivePublicKey(privatePem) {
+  const pub = crypto2.createPublicKey(privatePem);
+  return pub.export({ type: "spki", format: "pem" }).toString();
+}
+var sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+async function registerPublicKey(keysDir) {
+  const vmId = readFile(`${keysDir}/vm_id`);
+  const token = readFile(`${keysDir}/bootstrap_token`);
+  const registerUrl = readFile(`${keysDir}/register_api_url`);
+  const publicKey = readFile(`${keysDir}/vm_public_key.pem`);
+  if (!token || !registerUrl) return;
+  if (!vmId || !publicKey) {
+    console.warn("[keys] missing vm_id / vm_public_key.pem \u2014 cannot register");
+    return;
+  }
+  const maxAttempts = 10;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const res = await fetch(registerUrl, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}`, "content-type": "application/json" },
+        body: JSON.stringify({ vm_id: vmId, public_key: publicKey })
+      });
+      if (res.ok) {
+        console.log(`[keys] registered public key (attempt ${attempt})`);
+        return;
+      }
+      if (res.status === 409) {
+        console.error("[keys] registration refused (409): identity already registered to another key");
+        return;
+      }
+      console.warn(`[keys] register attempt ${attempt}/${maxAttempts}: HTTP ${res.status}`);
+    } catch (err) {
+      console.warn(`[keys] register attempt ${attempt}/${maxAttempts} failed: ${err.message}`);
+    }
+    await sleep(Math.min(2e3 * attempt, 15e3));
+  }
+  console.error(`[keys] gave up registering after ${maxAttempts} attempts`);
+}
+function signDetached(keysDir, message2) {
+  const privatePem = readFileSync2(`${keysDir}/vm_private_key.pem`, "utf8");
+  const key = crypto2.createPrivateKey(privatePem);
+  return crypto2.sign(null, Buffer.from(message2, "utf8"), key).toString("base64");
+}
+
 // src/store-client.ts
-import { readFileSync as readFileSync2, writeFileSync as writeFileSync2, existsSync as existsSync2 } from "fs";
+import { readFileSync as readFileSync3, writeFileSync as writeFileSync3, existsSync as existsSync3 } from "fs";
 function makeStoreClient(url, getToken2) {
   if (url.startsWith("file:")) {
     const path = url.replace(/^file:(\/\/)?/, "");
     return {
       async fetchRecord() {
-        if (!existsSync2(path)) return null;
-        return JSON.parse(readFileSync2(path, "utf8"));
+        if (!existsSync3(path)) return null;
+        return JSON.parse(readFileSync3(path, "utf8"));
       },
       async putRecord(record) {
-        writeFileSync2(path, JSON.stringify(record), { mode: 384 });
+        writeFileSync3(path, JSON.stringify(record), { mode: 384 });
       }
     };
   }
@@ -765,24 +836,30 @@ function makeHttpClient(url, headers) {
     }
   };
 }
-async function fetchRules(url, getToken2) {
+async function fetchList(url, key, getToken2) {
   if (url.startsWith("file:")) {
     const path = url.replace(/^file:(\/\/)?/, "");
-    if (!existsSync2(path)) return [];
-    const parsed = JSON.parse(readFileSync2(path, "utf8"));
+    if (!existsSync3(path)) return [];
+    const parsed = JSON.parse(readFileSync3(path, "utf8"));
     if (Array.isArray(parsed)) return parsed;
-    return parsed.rules ?? [];
+    return parsed[key] ?? [];
   }
   const res = await fetch(url, {
     headers: getToken2 ? { Authorization: `Bearer ${await getToken2()}` } : {}
   });
-  if (!res.ok) throw new Error(`rules GET failed: ${res.status}`);
+  if (!res.ok) throw new Error(`${key} GET failed: ${res.status}`);
   const body = await res.json();
-  return body.rules ?? [];
+  return body[key] ?? [];
+}
+function fetchRules(url, getToken2) {
+  return fetchList(url, "rules", getToken2);
+}
+function fetchIdentities(url, getToken2) {
+  return fetchList(url, "identities", getToken2);
 }
 
 // src/box-token.ts
-import { readFileSync as readFileSync3 } from "fs";
+import { readFileSync as readFileSync4 } from "fs";
 
 // ../../node_modules/.pnpm/jose@6.2.2/node_modules/jose/dist/webapi/lib/buffer_utils.js
 var encoder = new TextEncoder();
@@ -2288,7 +2365,7 @@ var SignJWT = class {
 
 // src/box-token.ts
 function makeBoxTokenSigner(keysDir) {
-  const read = (name) => readFileSync3(`${keysDir}/${name}`, "utf-8").trim();
+  const read = (name) => readFileSync4(`${keysDir}/${name}`, "utf-8").trim();
   return async () => {
     const vmId = read("vm_id");
     const key = await importPKCS8(read("vm_private_key.pem"), "EdDSA");
@@ -2297,7 +2374,7 @@ function makeBoxTokenSigner(keysDir) {
 }
 
 // src/sync.ts
-import { writeFileSync as writeFileSync3, mkdirSync as mkdirSync2, renameSync } from "fs";
+import { writeFileSync as writeFileSync4, mkdirSync as mkdirSync3, renameSync } from "fs";
 import { join } from "path";
 function decryptToConfig(record, boxKey, ids2) {
   const plaintext = openWithBoxKey(record, boxKey, ids2);
@@ -2305,25 +2382,26 @@ function decryptToConfig(record, boxKey, ids2) {
   return cfg;
 }
 function writeProxyConfig(dir, cfg) {
-  mkdirSync2(dir, { recursive: true });
+  mkdirSync3(dir, { recursive: true });
   const writeAtomic = (name, data) => {
     const tmp = join(dir, `.${name}.tmp`);
     const dst = join(dir, name);
-    writeFileSync3(tmp, JSON.stringify(data, null, 2), { mode: 384 });
+    writeFileSync4(tmp, JSON.stringify(data, null, 2), { mode: 384 });
     renameSync(tmp, dst);
   };
   writeAtomic("credentials.json", cfg.credentials ?? []);
   writeAtomic("rules.json", cfg.rules ?? []);
+  writeAtomic("identities.json", cfg.identities ?? []);
 }
 
 // src/permissions.ts
-import { readFileSync as readFileSync4, writeFileSync as writeFileSync4, existsSync as existsSync3 } from "fs";
+import { readFileSync as readFileSync5, writeFileSync as writeFileSync5, existsSync as existsSync4 } from "fs";
 var PermissionBridge = class {
   constructor(opts) {
     this.opts = opts;
-    if (existsSync3(opts.grantsPath)) {
+    if (existsSync4(opts.grantsPath)) {
       try {
-        this.grants = JSON.parse(readFileSync4(opts.grantsPath, "utf8"));
+        this.grants = JSON.parse(readFileSync5(opts.grantsPath, "utf8"));
       } catch {
         this.grants = {};
       }
@@ -2341,8 +2419,8 @@ var PermissionBridge = class {
   }
   /** Submit any new pending permission requests to ControlClaw (idempotent). */
   async drainPending() {
-    if (!existsSync3(this.opts.pendingPath)) return;
-    const lines = readFileSync4(this.opts.pendingPath, "utf8").split("\n").filter(Boolean);
+    if (!existsSync4(this.opts.pendingPath)) return;
+    const lines = readFileSync5(this.opts.pendingPath, "utf8").split("\n").filter(Boolean);
     for (const line of lines) {
       let rec;
       try {
@@ -2402,7 +2480,7 @@ var PermissionBridge = class {
       }
     }
     if (changed) {
-      writeFileSync4(this.opts.grantsPath, JSON.stringify(this.grants, null, 2), { mode: 384 });
+      writeFileSync5(this.opts.grantsPath, JSON.stringify(this.grants, null, 2), { mode: 384 });
       console.log(`[perm] wrote ${Object.keys(this.grants).length} grant(s)`);
     }
   }
@@ -2437,11 +2515,11 @@ async function requireAuth(req, res) {
 }
 
 // src/ready.ts
-import { readFileSync as readFileSync5 } from "fs";
+import { readFileSync as readFileSync6 } from "fs";
 var KEYS_DIR = process.env.KEYS_DIR ?? "/opt/controlclaw/keys";
 function readKeyFile(name) {
   try {
-    return readFileSync5(`${KEYS_DIR}/${name}`, "utf-8").trim();
+    return readFileSync6(`${KEYS_DIR}/${name}`, "utf-8").trim();
   } catch {
     return null;
   }
@@ -2450,7 +2528,7 @@ async function signReadyToken(vmId, privateKeyPem) {
   const key = await importPKCS8(privateKeyPem, "EdDSA");
   return new SignJWT({ vmId }).setProtectedHeader({ alg: "EdDSA" }).setIssuedAt().setExpirationTime("30s").sign(key);
 }
-var sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+var sleep2 = (ms) => new Promise((r) => setTimeout(r, ms));
 async function reportReady() {
   const vmId = readKeyFile("vm_id");
   const readyUrl = readKeyFile("ready_api_url");
@@ -2472,7 +2550,7 @@ async function reportReady() {
     } catch (err) {
       console.warn(`[ready] attempt ${attempt}/${maxAttempts} failed: ${err.message}`);
     }
-    await sleep(Math.min(2e3 * attempt, 15e3));
+    await sleep2(Math.min(2e3 * attempt, 15e3));
   }
   console.error(`[ready] gave up after ${maxAttempts} attempts`);
 }
@@ -2483,6 +2561,7 @@ var KEYS_DIR2 = process.env.KEYS_DIR ?? "/opt/controlclaw/keys";
 var BOX_KEY_PATH = process.env.BOX_KEY_PATH ?? `${KEYS_DIR2}/box_key`;
 var STORE_URL = process.env.STORE_URL ?? "";
 var RULES_URL = process.env.RULES_URL ?? "";
+var IDENTITIES_URL = process.env.IDENTITIES_URL ?? "";
 var PROXY_CONFIG_DIR = process.env.PROXY_CONFIG_DIR ?? "/run/mitm/config";
 var CA_CERT_PATH = process.env.CA_CERT_PATH ?? "";
 var CA_URL = process.env.CA_URL ?? "";
@@ -2512,9 +2591,12 @@ async function runSync(boxKey) {
   if (RULES_URL) {
     cfg.rules = await fetchRules(RULES_URL, getToken);
   }
+  if (IDENTITIES_URL) {
+    cfg.identities = await fetchIdentities(IDENTITIES_URL, getToken);
+  }
   writeProxyConfig(PROXY_CONFIG_DIR, cfg);
   console.log(
-    `[mitm-agent] synced v${record?.version ?? 0}: ${(cfg.credentials ?? []).length} creds, ${(cfg.rules ?? []).length} rules`
+    `[mitm-agent] synced v${record?.version ?? 0}: ${(cfg.credentials ?? []).length} creds, ${(cfg.rules ?? []).length} rules, ${(cfg.identities ?? []).length} identities`
   );
 }
 async function maybeMigrate() {
@@ -2528,7 +2610,7 @@ async function maybeMigrate() {
     sourceIds: { orgId: ORG_ID, boxId: MIGRATE_SOURCE_BOX_ID },
     newBoxId: BOX_ID
   });
-  writeFileSync5(BOX_KEY_PATH, boxKey, { mode: 384 });
+  writeFileSync6(BOX_KEY_PATH, boxKey, { mode: 384 });
   await makeStoreClient(STORE_URL).putRecord(record);
   console.log(`[mitm-agent] migrated to v${record.version} under a fresh box key`);
   return boxKey;
@@ -2536,6 +2618,8 @@ async function maybeMigrate() {
 async function main() {
   if (!ORG_ID || !BOX_ID) die("ORG_ID and BOX_ID are required");
   if (!STORE_URL) die("STORE_URL is required");
+  ensureVmKeypair(KEYS_DIR2);
+  await registerPublicKey(KEYS_DIR2);
   let boxKey;
   try {
     boxKey = await maybeMigrate();
@@ -2553,7 +2637,7 @@ async function main() {
     process.exit(0);
   }
   try {
-    setSaasPublicKey(readFileSync6(`${KEYS_DIR2}/saas_public_key.pem`, "utf-8"));
+    setSaasPublicKey(readFileSync7(`${KEYS_DIR2}/saas_public_key.pem`, "utf-8"));
   } catch (err) {
     die(`failed to load SaaS public key: ${err.message}`);
   }
@@ -2585,13 +2669,14 @@ async function main() {
     if (CA_CERT_PATH && CA_URL && getToken) {
       void (async () => {
         try {
-          const caCert = readFileSync6(CA_CERT_PATH, "utf8");
+          const caCert = readFileSync7(CA_CERT_PATH, "utf8");
+          const caSig = signDetached(KEYS_DIR2, caCert);
           const res = await fetch(CA_URL, {
             method: "POST",
             headers: { Authorization: `Bearer ${await getToken()}`, "content-type": "application/json" },
-            body: JSON.stringify({ ca_cert: caCert })
+            body: JSON.stringify({ ca_cert: caCert, ca_sig: caSig })
           });
-          console.log(`[mitm-agent] published CA cert (HTTP ${res.status})`);
+          console.log(`[mitm-agent] published signed CA cert (HTTP ${res.status})`);
         } catch (err) {
           console.error("[mitm-agent] CA publish failed:", err.message);
         }

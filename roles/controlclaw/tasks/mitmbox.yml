@@ -57,6 +57,9 @@
   when: not ci_test
 
 # --- box keys (control + outbound box-JWT auth, same as the vm-agent) ---
+# On-box keygen: the mitm-agent generates its OWN vm keypair and registers the public key with the
+# bootstrap token below — we do NOT ship vm_private_key.pem (it never leaves the box, and it also
+# signs the published CA). Legacy boxes would still receive vm_private_key separately.
 - name: Write mitm box keys
   ansible.builtin.copy:
     dest: "/opt/controlclaw/keys/{{ item.name }}"
@@ -65,10 +68,11 @@
     group: "{{ controlclaw_user }}"
     mode: "{{ item.mode }}"
   loop:
-    - { name: vm_private_key.pem, content: "{{ vm_private_key | default('') }}", mode: '0600' }
     - { name: saas_public_key.pem, content: "{{ saas_public_key | default('') }}", mode: '0644' }
     - { name: vm_id, content: "{{ vm_id | default('') }}", mode: '0644' }
     - { name: ready_api_url, content: "{{ ready_api_url | default('') }}", mode: '0644' }
+    - { name: bootstrap_token, content: "{{ vm_bootstrap_token | default('') }}", mode: '0600' }
+    - { name: register_api_url, content: "{{ register_api_url | default('') }}", mode: '0644' }
   no_log: true
   when: vm_id is defined
 
@@ -135,6 +139,62 @@
   changed_when: true
   when: not ci_test
 
+# --- DNS: the OpenClaw boxes' egress is transparently redirected by IP (redsocks), so they must
+#     resolve names first. They point /etc/resolv.conf at this box; dnsmasq forwards upstream
+#     (its own queries leave via the masquerade above). The Hetzner firewall already permits UDP to
+#     the mitm IP, so no control-plane firewall change is needed. ---
+- name: Install dnsmasq (resolver for the private network)
+  ansible.builtin.apt:
+    name: dnsmasq
+    state: present
+    update_cache: true
+  when: not ci_test
+
+# The mitm box's own private IP isn't known at cloud-init build time (Hetzner assigns it after
+# create), so discover it on-box: the only address in the org private subnet.
+- name: Discover this box's private IP (address in the org subnet)
+  ansible.builtin.shell: >-
+    ip -4 -o addr show | awk '{print $4}' | cut -d/ -f1 |
+    grep -E '^{{ mitm_private_subnet.split('.')[0:2] | join('.') | regex_escape }}\.' | head -1
+  args:
+    executable: /bin/bash
+  register: mitm_self_private_ip
+  changed_when: false
+  when: not ci_test
+
+- name: Configure dnsmasq to serve the private network only
+  ansible.builtin.copy:
+    dest: /etc/dnsmasq.d/controlclaw.conf
+    mode: '0644'
+    content: |
+      # ControlClaw private-net resolver. Bind to loopback + the private IP only (never the
+      # public interface), forward to upstream resolvers, and answer only from the private subnet.
+      bind-interfaces
+      listen-address=127.0.0.1
+      listen-address={{ mitm_self_private_ip.stdout }}
+      server=1.1.1.1
+      server=8.8.8.8
+      cache-size=1000
+  notify: restart dnsmasq
+  when: not ci_test and mitm_self_private_ip.stdout | default('') | length > 0
+
+- name: Allow DNS from the private network only
+  community.general.ufw:
+    rule: allow
+    port: '53'
+    proto: "{{ item }}"
+    src: "{{ mitm_private_subnet }}"
+    comment: 'ControlClaw DNS (private net)'
+  loop: [udp, tcp]
+  when: not ci_test
+
+- name: Enable and start dnsmasq
+  ansible.builtin.systemd:
+    name: dnsmasq
+    state: started
+    enabled: true
+  when: not ci_test
+
 # --- systemd services ---
 - name: Create controlclaw-mitmproxy service
   ansible.builtin.copy:
@@ -154,7 +214,16 @@
       Environment=MITM_PENDING_PATH=/run/mitm/config/pending.jsonl
       Environment=MITM_LOG_FILE=/opt/controlclaw/mitm/traffic.jsonl
       Environment=MITM_TENANT={{ org_id | default('unknown') }}
+      # SNI-based passthrough for the control plane (works for transparent redsocks CONNECT-to-IP,
+      # where --ignore-hosts can't match a hostname). The addon tls_clienthello hook reads this.
+      Environment=MITM_CONTROL_PLANE_HOST={{ controlclaw_url | urlsplit('hostname') }}
+      # --ignore-hosts: do NOT intercept the ControlClaw control plane — tunnel it (real public
+      # TLS) so the JWT control channel never depends on this proxy's CA and the proxy can't MITM
+      # its own control plane. Anchored to the exact host:port so an agent can't abuse a substring
+      # match (e.g. controlclaw.com.attacker.com) to exfiltrate through an un-inspected tunnel.
+      # NOTE: $$ — systemd expands $VAR in ExecStart, so a literal regex '$' must be doubled.
       ExecStart=/opt/controlclaw/mitm/venv/bin/mitmdump --listen-port {{ mitm_proxy_port }} \
+        --ignore-hosts "^{{ controlclaw_url | urlsplit('hostname') | regex_escape }}:[0-9]+$$" \
         --set confdir=/opt/controlclaw/mitm/ca -s /opt/controlclaw/mitm/proxy/addon.py
       Restart=always
       RestartSec=5
@@ -184,6 +253,7 @@
       Environment=PROXY_CONFIG_DIR=/run/mitm/config
       Environment=STORE_URL={{ controlclaw_url }}/api/vm-agent/store
       Environment=RULES_URL={{ controlclaw_url }}/api/vm-agent/egress-rules
+      Environment=IDENTITIES_URL={{ controlclaw_url }}/api/vm-agent/identities
       Environment=PERMISSION_URL={{ controlclaw_url }}/api/vm-agent/permission
       Environment=PENDING_PATH=/run/mitm/config/pending.jsonl
       Environment=GRANTS_PATH=/run/mitm/config/grants.json

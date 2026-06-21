@@ -72,6 +72,14 @@
 
       # Journal access - controlclaw logs only
       {{ controlclaw_user }} ALL=(ALL) NOPASSWD: /usr/bin/journalctl -u controlclaw *
+
+      # Mitm CA install - fixed root script (copies a fixed path into the trust store +
+      # update-ca-certificates). Hygiene bound; the trust check is the signature/pin in the agent.
+      {{ controlclaw_user }} ALL=(ALL) NOPASSWD: /usr/local/bin/cc-install-ca
+
+      # Transparent egress activator - fixed root script (applies the staged nftables redirect +
+      # flips DNS to the mitm box). Coverage bound; the firewall is the enforcement boundary.
+      {{ controlclaw_user }} ALL=(ALL) NOPASSWD: /usr/local/bin/cc-enable-egress
     validate: /usr/sbin/visudo -cf %s
 
 - name: Create .bash_profile to source .bashrc for login shells

@@ -4,51 +4,184 @@
 # human-in-the-loop permission flow. Egress is ENFORCED at the Hetzner firewall (the box
 # can only reach the mitm box's private IP); this only configures the client side.
 
-# The CA is passed in by createVm (read from the org mitm box's published cert). If the mitm
-# box hasn't published yet when the FIRST OpenClaw box provisions, the vm-agent installs it on a
-# later config sync (config endpoint returns mitm.caCert) — see docs/plans/part-ca-handoff.md.
-- name: Install the mitm CA into the trust store
-  ansible.builtin.copy:
-    dest: /usr/local/share/ca-certificates/controlclaw-mitm.crt
-    content: "{{ mitm_ca_cert }}"
-    mode: '0644'
-  when: (mitm_ca_cert | default('')) | length > 0
-  notify: update ca certificates
+# CA trust is established by the vm-agent at runtime (signed + pinned), NOT baked here: the
+# agent polls the config endpoint, verifies the CA's detached signature against the pinned mitm
+# public key, then installs it via cc-install-ca BEFORE reporting ready. This closes the
+# control-plane-injection hole (a forged CA from a compromised control plane is refused).
 
-- name: Route outbound HTTP(S) through the mitm box
+# Pin the mitm box's PUBLIC key so the agent accepts only a CA signed by it. Available at
+# provisioning for the 2nd+ box; empty for the org's first box (the agent TOFU-pins on first
+# sight). Marker file `mitm_box_private_ip` also tells the agent it's behind a proxy (→ require
+# a trusted CA before ready).
+- name: Pin the mitm box public key (for CA-signature verification)
   ansible.builtin.copy:
-    dest: /etc/profile.d/controlclaw-egress.sh
+    dest: /opt/controlclaw/keys/mitm_pinned_pubkey.pem
+    content: "{{ mitm_vm_public_key }}"
+    owner: "{{ controlclaw_user }}"
+    group: "{{ controlclaw_user }}"
     mode: '0644'
-    content: |
-      # Forced egress via the org mitm box (the box can only reach this IP anyway).
-      export HTTP_PROXY="http://{{ mitm_box_private_ip }}:{{ mitm_proxy_port }}"
-      export HTTPS_PROXY="http://{{ mitm_box_private_ip }}:{{ mitm_proxy_port }}"
-      export http_proxy="$HTTP_PROXY"
-      export https_proxy="$HTTPS_PROXY"
-      export NO_PROXY="localhost,127.0.0.1,{{ mitm_box_private_ip }}"
+  when: mitm_vm_public_key is defined and mitm_vm_public_key | length > 0
+
+- name: Record the mitm box private IP (marks this box as proxy-confined)
+  ansible.builtin.copy:
+    dest: /opt/controlclaw/keys/mitm_box_private_ip
+    content: "{{ mitm_box_private_ip }}"
+    owner: "{{ controlclaw_user }}"
+    group: "{{ controlclaw_user }}"
+    mode: '0644'
   when: mitm_box_private_ip is defined and mitm_box_private_ip | length > 0
 
-- name: Ensure the openclaw systemd drop-in dir exists
-  # `copy` won't create the parent dir, and openclaw.service may not be installed yet
-  # (it's a separate product). A drop-in dir for an absent unit is harmless — systemd
-  # ignores it — but it must exist for the drop-in copy below to succeed.
+# Narrowly-scoped privileged CA installer: copies a FIXED box-owned path into the trust store and
+# runs update-ca-certificates. The vm-agent writes the verified cert to that fixed path, then runs
+# `sudo /usr/local/bin/cc-install-ca`. Bounds the mechanism; the trust check is the signature/pin.
+- name: Deploy cc-install-ca (root-owned, fixed source/dest)
+  ansible.builtin.copy:
+    dest: /usr/local/bin/cc-install-ca
+    owner: root
+    group: root
+    mode: '0755'
+    content: |
+      #!/bin/sh
+      set -e
+      install -m 0644 /opt/controlclaw/keys/mitm-ca.crt \
+        /usr/local/share/ca-certificates/controlclaw-mitm.crt
+      update-ca-certificates
+
+# --- Transparent egress via redsocks (app-agnostic; replaces HTTP_PROXY env) ---
+# All HTTP(S) is captured at the kernel level by an nftables REDIRECT → local redsocks, which opens
+# an explicit CONNECT to the mitm proxy. This catches apps that ignore HTTP_PROXY (Node fetch, the
+# vm-agent itself, static binaries). The Hetzner firewall remains the enforcement boundary — these
+# rules are coverage, and flushing them inside the box only loses connectivity (can still reach only
+# the mitm IP), never a bypass. The redirect + DNS flip are ACTIVATED by the vm-agent
+# (cc-enable-egress) once it has confirmed the mitm proxy is reachable — so bootstrap (ansible-pull,
+# register, CA install) runs first with direct egress, and we never cut the box's own egress before
+# the mitm box is up.
+- name: Install redsocks
+  ansible.builtin.apt:
+    name: redsocks
+    state: present
+    update_cache: true
+  when: mitm_box_private_ip is defined and mitm_box_private_ip | length > 0
+
+- name: Create a dedicated redsocks user (least privilege)
+  ansible.builtin.user:
+    name: redsocks
+    system: true
+    shell: /usr/sbin/nologin
+    create_home: false
+  when: mitm_box_private_ip is defined and mitm_box_private_ip | length > 0
+
+- name: Create the egress config dir
   ansible.builtin.file:
-    path: /etc/systemd/system/openclaw.service.d
+    path: /opt/controlclaw/egress
     state: directory
     mode: '0755'
   when: mitm_box_private_ip is defined and mitm_box_private_ip | length > 0
 
-- name: Set proxy for the openclaw systemd service
+- name: Write redsocks config (transparent → explicit CONNECT to the mitm proxy)
   ansible.builtin.copy:
-    dest: /etc/systemd/system/openclaw.service.d/egress-proxy.conf
+    dest: /opt/controlclaw/egress/redsocks.conf
     mode: '0644'
     content: |
+      base {
+        log_debug = off;
+        log_info = on;
+        log = "syslog:daemon";
+        daemon = off;
+        redirector = iptables;
+      }
+      redsocks {
+        local_ip = 127.0.0.1;
+        local_port = 12345;
+        ip = {{ mitm_box_private_ip }};
+        port = {{ mitm_proxy_port }};
+        type = http-connect;
+      }
+  when: mitm_box_private_ip is defined and mitm_box_private_ip | length > 0
+
+- name: Create controlclaw-redsocks service
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/controlclaw-redsocks.service
+    mode: '0644'
+    content: |
+      [Unit]
+      Description=ControlClaw redsocks (transparent egress → mitm proxy)
+      After=network.target
+
       [Service]
-      Environment=HTTP_PROXY=http://{{ mitm_box_private_ip }}:{{ mitm_proxy_port }}
-      Environment=HTTPS_PROXY=http://{{ mitm_box_private_ip }}:{{ mitm_proxy_port }}
-      Environment=NO_PROXY=localhost,127.0.0.1
+      Type=simple
+      User=redsocks
+      ExecStart=/usr/sbin/redsocks -c /opt/controlclaw/egress/redsocks.conf
+      Restart=always
+      RestartSec=5
+
+      [Install]
+      WantedBy=multi-user.target
   when: mitm_box_private_ip is defined and mitm_box_private_ip | length > 0
   notify: reload systemd
+
+# nftables REDIRECT ruleset — STAGED, not applied here (cc-enable-egress applies it at the right
+# time). Idempotent (add+flush+rebuild). Exempts the mitm box, loopback, and the private subnet so
+# the redsocks→proxy CONNECT and intra-net traffic are never redirected (loop-safe).
+# Redirects ALL TCP (not just 80/443): the mitm proxy is the single policy point — it intercepts
+# HTTP(S), passes through allowlisted `tunnel` destinations, and DROPS everything else. This makes
+# non-HTTP egress (DB, SSH-git) allowlistable from the dashboard instead of silently firewall-
+# blocked, and centralizes the decision (+ logging) at the proxy. The Hetzner firewall (egress only
+# to the mitm IP) remains the enforcement backstop; redsocks only ever connects to the mitm IP.
+- name: Stage the transparent-redirect nftables ruleset
+  ansible.builtin.copy:
+    dest: /opt/controlclaw/egress/redirect.nft
+    mode: '0644'
+    content: |
+      #!/usr/sbin/nft -f
+      add table ip controlclaw_redirect
+      flush table ip controlclaw_redirect
+      table ip controlclaw_redirect {
+        chain output {
+          type nat hook output priority -100; policy accept;
+          ip daddr {{ mitm_box_private_ip }} return
+          ip daddr 127.0.0.0/8 return
+          ip daddr {{ mitm_private_subnet }} return
+          meta l4proto tcp redirect to :12345
+        }
+      }
+  when: mitm_box_private_ip is defined and mitm_box_private_ip | length > 0
+
+# DNS: redsocks captures by IP, so the box must resolve names first. Point systemd-resolved at the
+# mitm box (which runs dnsmasq). STAGED — the flip takes effect only when cc-enable-egress restarts
+# resolved, so bootstrap keeps the default resolver until the mitm path is confirmed up.
+- name: Ensure the systemd-resolved drop-in dir exists
+  ansible.builtin.file:
+    path: /etc/systemd/resolved.conf.d
+    state: directory
+    mode: '0755'
+  when: mitm_box_private_ip is defined and mitm_box_private_ip | length > 0
+
+- name: Stage the DNS drop-in (resolver → mitm box)
+  ansible.builtin.copy:
+    dest: /etc/systemd/resolved.conf.d/controlclaw.conf
+    mode: '0644'
+    content: |
+      [Resolve]
+      DNS={{ mitm_box_private_ip }}
+      Domains=~.
+      FallbackDNS=
+  when: mitm_box_private_ip is defined and mitm_box_private_ip | length > 0
+
+# Narrowly-scoped activator: applies the staged redirect + flips DNS. Run by the vm-agent
+# (`sudo cc-enable-egress`) after it has installed the CA and probed the mitm proxy. Idempotent.
+- name: Deploy cc-enable-egress (root-owned, fixed actions)
+  ansible.builtin.copy:
+    dest: /usr/local/bin/cc-enable-egress
+    owner: root
+    group: root
+    mode: '0755'
+    content: |
+      #!/bin/sh
+      set -e
+      systemctl enable --now controlclaw-redsocks
+      nft -f /opt/controlclaw/egress/redirect.nft
+      systemctl restart systemd-resolved
 
 - name: Deploy cc-perm CLI (self-contained bundle)
   ansible.builtin.copy:
