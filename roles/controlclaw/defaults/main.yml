@@ -29,6 +29,9 @@ exit_relay_cert_volume_device: "/dev/disk/by-id/scsi-0HC_Volume_{{ exit_relay_ce
 # Further names the one certificate must also cover. exit.<domain> alone ran into Let's Encrypt's
 # weekly limit, so the live certificate covers exit2.<domain> as well and the relay answers on
 # either. They share a lineage named after exit_relay_host, so the paths below do not move.
+# Note the trade-off: one certificate covering several names means certbot validates all of them in
+# one order, so a name in this list that does NOT resolve to this box fails the order and the relay
+# gets no certificate for the primary name either. Only put names here that point at this relay.
 exit_relay_extra_hosts: []
 
 # Where certbot keeps the lineage this relay reads. --cert-name pins it to exit_relay_host, so
