@@ -478,7 +478,10 @@
       {{ controlclaw_user }} ALL=(ALL) NOPASSWD: /usr/local/bin/cc-secure thumbprint
       {{ controlclaw_user }} ALL=(ALL) NOPASSWD: /usr/local/bin/cc-secure bind *
       {{ controlclaw_user }} ALL=(ALL) NOPASSWD: /usr/local/bin/cc-secure unbind *
-      {{ controlclaw_user }} ALL=(ALL) NOPASSWD: /usr/local/bin/cc-secure rekey
+      # `rekey` is not here any more. Nothing the agent does calls it, it changes the passphrase
+      # the recovery key opens, and until it was made safe to interrupt the box user could strand
+      # that passphrase with `timeout 2 sudo cc-secure rekey`. Root runs it; if a route for it is
+      # ever built, it goes back with that route.
       {{ controlclaw_user }} ALL=(ALL) NOPASSWD: /usr/local/bin/cc-secure reseal
       {% if box_role == 'openclaw' %}
       # Making an agent's own storage larger (docs/plans/agent-storage-growth.md). `size` reads and

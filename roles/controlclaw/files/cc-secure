@@ -247,6 +247,9 @@ cmd_mount() {
       log "tang is serving on 127.0.0.1:${TANGD_PORT}"
     fi
   fi
+  # A rekey that a reboot or a kill cut short is put right here, before anything uses the key
+  # file. In a subshell: whatever it finds, the box still comes up.
+  ( finish_interrupted_rekey "$(loopdev)" ) || log "ERROR: an interrupted rekey could not be put right; run rekey"
   [ -z "$failed" ] || die "mounted at $SECURE, but these could not be mounted:$failed$failed_optional"
   if [ -n "$failed_optional" ]; then
     log "mounted at $SECURE, but these optional directories could not be mounted:$failed_optional"
@@ -611,6 +614,8 @@ cmd_bind() {
   take_lock
   [ -s "$KEYFILE" ] || die "no $KEYFILE; cannot add a slot"
   local loop; loop=$(loopdev)
+  # The key file has to be the one that opens slot 0: clevis authorises its new slot with it.
+  finish_interrupted_rekey "$loop"
 
   # Idempotent on the URL, because that is what identifies a partner box. A partner whose tang key
   # changed keeps the same URL, so re-binding it replaces the slot rather than adding a second one.
@@ -718,19 +723,98 @@ for line in sys.stdin:
 # keyfile. It is NOT the answer to a shell-access grant: a root shell on a running box reads the
 # dm-crypt master key out of the kernel, and changing a keyslot leaves that master key alone. See
 # §7.5 — that case is "assume the key is known, rebuild the box", and the console says so.
+# A rekey that was interrupted, put right. Safe to call at any time the container is mounted, and
+# called before anything that needs the key file.
+#
+# rekey leaves two marks inside the container while it works: `$KEYFILE.new`, the new passphrase,
+# written and synced BEFORE slot 0 is changed, and `$KEYFILE.reseal`, which says the sealed blob may
+# be behind. Whatever moment it was stopped at (a kill -9 included), one of the two files opens slot
+# 0, and this finds out which:
+#
+#   the key file opens slot 0     the change never happened: the new file is dropped
+#   the new file opens slot 0     the change happened: the new file becomes the key file (a rename)
+#   neither                       nothing is touched, and it says so
+#
+# Then, if the mark is there, the blob is sealed again from the key file.
+finish_interrupted_rekey() {
+  local loop=$1
+  [ -e "$KEYFILE.new" ] || [ -e "$KEYFILE.reseal" ] || return 0
+  # A luksChangeKey that outlived its cc-secure decides which file is right when it ends, so wait
+  # for it rather than judge too early.
+  local tenths=1800
+  while [ -n "$(changekey_pids "$loop")" ]; do
+    [ "$tenths" -gt 0 ] || die "an earlier rekey is still changing slot 0 (pids: $(changekey_pids "$loop" | paste -sd, -)); nothing was changed"
+    sleep 0.1; tenths=$(( tenths - 1 ))
+  done
+  if [ -e "$KEYFILE.new" ]; then
+    if [ -s "$KEYFILE" ] && opens_slot0 "$loop" "$KEYFILE"; then
+      rm -f "$KEYFILE.new"
+      log "an interrupted rekey had not changed slot 0; dropped its unused passphrase"
+    elif [ -s "$KEYFILE.new" ] && opens_slot0 "$loop" "$KEYFILE.new"; then
+      mv -f "$KEYFILE.new" "$KEYFILE"
+      sync "$(dirname "$KEYFILE")" 2>/dev/null || sync
+      log "finished an interrupted rekey: the key file now holds the passphrase slot 0 was changed to"
+    else
+      die "neither $KEYFILE nor $KEYFILE.new opens slot 0; nothing was touched. The disk still opens through its partners"
+    fi
+  fi
+  if [ -e "$KEYFILE.reseal" ]; then
+    [ -s "$RECOVERY_PUB" ] || die "the recovery blob may hold an old passphrase and there is no recovery public key to seal to"
+    seal_to_recovery "$KEYFILE" || die "the recovery blob may hold an old passphrase and could not be sealed again; run reseal"
+    rm -f "$KEYFILE.reseal"
+    log "re-sealed the recovery blob after an interrupted rekey"
+  fi
+}
+
+opens_slot0() { cryptsetup open --test-passphrase --key-slot 0 --key-file "$2" "$1" >/dev/null 2>&1; }
+
+# `cryptsetup luksChangeKey` on this device, as pids.
+changekey_pids() {
+  ps -e -o pid=,args= 2>/dev/null | awk -v dev="$1" '
+    $2 ~ /cryptsetup$/ && $3 == "luksChangeKey" { for (i = 4; i <= NF; i++) if ($i == dev) { print $1; break } }'
+}
+
 cmd_rekey() {
   is_mounted || die "container is not mounted"
   [ -s "$KEYFILE" ] || die "no $KEYFILE"
   [ -s "$RECOVERY_PUB" ] || die "no recovery public key; a rekey would leave no way back in"
   take_lock
   stop_leftover_bind "$(loopdev)"
-  local loop tmp; loop=$(loopdev)
-  tmp=$(mktemp -p /dev/shm cc-secure.XXXXXX); chmod 0600 "$tmp"
-  head -c 32 /dev/urandom | base64 -w0 > "$tmp"
-  cryptsetup luksChangeKey --key-file "$KEYFILE" --new-keyfile "$tmp" "$loop" \
-    || { rm -f "$tmp"; die "luksChangeKey failed; the old passphrase still works"; }
-  seal_to_recovery "$tmp" || { rm -f "$tmp"; die "rekeyed but could not re-seal; $KEYFILE is authoritative"; }
-  install -m 0600 "$tmp" "$KEYFILE"; rm -f "$tmp"
+  local loop; loop=$(loopdev)
+  finish_interrupted_rekey "$loop"
+
+  # From here to the rename, nothing may stop this half-way and lose the only copy of a
+  # passphrase. TERM, INT and HUP are ignored (cryptsetup inherits that); a kill -9 or a power cut
+  # cannot be, and is what the two files below are for: see finish_interrupted_rekey.
+  #
+  # The order is the whole point, and it was wrong twice. The passphrase used to live in /dev/shm
+  # until after slot 0 was changed: stopped in between (`timeout 2 sudo cc-secure rekey` was
+  # enough, the change takes about nine seconds), slot 0 had a passphrase that existed nowhere on
+  # disk, and the key file and the recovery blob both held the old one.
+  trap '' TERM INT HUP
+  local new="$KEYFILE.new"
+  ( umask 077; head -c 32 /dev/urandom | base64 -w0 > "$new" ) || die "could not write $new; nothing was changed"
+  : > "$KEYFILE.reseal"
+  # On the disk, file and directory, before slot 0 is touched.
+  sync "$new" "$KEYFILE.reseal" 2>/dev/null || sync
+  sync "$(dirname "$KEYFILE")" 2>/dev/null || sync
+
+  # The new key file is the second positional argument. `--new-keyfile` is luksAddKey's option:
+  # cryptsetup 2.7.0 (Ubuntu 24.04) answers "Option --new-keyfile is not allowed with luksChangeKey
+  # action", so until this was fixed a rekey changed nothing on any box. --key-slot 0: the slot this
+  # script's passphrase lives in, so the new one stays where `open-with` and the sealed blob expect it.
+  if ! cryptsetup luksChangeKey --batch-mode --key-slot 0 --key-file "$KEYFILE" "$loop" "$new"; then
+    # Refused, or stopped: which of the two it was is read from the header, not guessed.
+    finish_interrupted_rekey "$loop"
+    die "luksChangeKey failed; the key file holds whatever opens slot 0"
+  fi
+  # A rename, never unlink-then-create: at every instant one name holds a passphrase that works.
+  mv -f "$new" "$KEYFILE"
+  sync "$(dirname "$KEYFILE")" 2>/dev/null || sync
+  trap - TERM INT HUP
+
+  seal_to_recovery "$KEYFILE" || die "rekeyed, and $KEYFILE holds the new passphrase, but it could not be sealed: the recovery blob still holds the old one. Run reseal"
+  rm -f "$KEYFILE.reseal"
   log "rekeyed slot 0 and re-sealed the recovery blob"
 }
 
@@ -742,7 +826,9 @@ cmd_reseal() {
   [ -s "$RECOVERY_PUB" ] || die "no recovery public key"
   take_lock
   stop_leftover_bind "$(loopdev)"
+  finish_interrupted_rekey "$(loopdev)"
   seal_to_recovery "$KEYFILE" || die "could not seal to the new recovery key"
+  rm -f "$KEYFILE.reseal"
   log "re-sealed to the current recovery key"
 }
 
