@@ -6,7 +6,7 @@ import './fixtures/home.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { appendFileSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { runInNewContext } from 'node:vm';
 import { LiveBridge } from '../roles/controlclaw/files/meeting-voice/live.js';
@@ -41,7 +41,7 @@ test('the first consult carries the whole meeting; a later one only what finishe
   assert.match(first.context, /The meeting so far[\s\S]*launch moved to Thursday[\s\S]*twelve thousand/);
   assert.equal(first.ccMeetingDelta, undefined, 'nothing is known to be in the consult session yet');
 
-  f.b.submitToolResult('d1', { text: 'Thursday.' });
+  f.b.submitToolResult('d1', { text: 'Thursday.', ccRecorded: true });
   caption(dir, 3, 'Carol', 'Marketing wants a demo video.');
   own(dir, 4, 'The launch is on Thursday.');
   const second = f.ask().args;
@@ -53,7 +53,7 @@ test('the first consult carries the whole meeting; a later one only what finishe
   assert.equal(rules(delta), rules(second.context), 'the rules come first and unchanged, so they cache');
   assert.match(rules(delta), /^How to handle this request/);
 
-  f.b.submitToolResult('d2', { text: 'ok' });
+  f.b.submitToolResult('d2', { text: 'ok', ccRecorded: true });
   const third = f.ask().args;
   assert.match(third.ccMeetingDelta, /Nothing more was said in the meeting since your last answer\./);
   f.b.close();
@@ -63,7 +63,7 @@ test('a failed consult is not counted, a restart starts over, a long gap sends t
   const dir = mkdtempSync(join(process.env.HOME, 'delta-'));
   caption(dir, 1, 'Alice', 'First point.');
   const f = bridge(dir);
-  f.ask(); f.b.submitToolResult('d1', { text: 'ok' });
+  f.ask(); f.b.submitToolResult('d1', { text: 'ok', ccRecorded: true });
   caption(dir, 2, 'Bob', 'Second point.');
   assert.match(f.ask().args.ccMeetingDelta, /Second point/);
   f.b.submitToolResult('d2', { error: 'Main-agent lookup failed' });
@@ -78,7 +78,7 @@ test('a failed consult is not counted, a restart starts over, a long gap sends t
   const next = g.ask().args.ccMeetingDelta;
   assert.match(next, /Second point[\s\S]*Third point/, 'the unanswered consult of the last session is not counted');
   assert.doesNotMatch(next, /First point/);
-  g.b.submitToolResult('d1', { text: 'ok' });
+  g.b.submitToolResult('d1', { text: 'ok', ccRecorded: true });
   // Another meeting in the same folder: nothing known.
   const h = bridge(dir, 'm2');
   assert.equal(h.ask().args.ccMeetingDelta, undefined);
@@ -94,14 +94,14 @@ test('what is being said now goes in; a line said twice is two lines; a consult 
   const dir = mkdtempSync(join(process.env.HOME, 'delta-'));
   caption(dir, 1, 'Alice', 'Yes.');
   const f = bridge(dir);
-  f.ask(); f.b.submitToolResult('d1', { text: 'ok' });
+  f.ask(); f.b.submitToolResult('d1', { text: 'ok', ccRecorded: true });
   caption(dir, 70, 'Alice', 'Yes.');
   live(dir, [[75, 'Bob', 'And the budget is']]);
   const d = f.ask().args.ccMeetingDelta;
   assert.match(d, /Alice: Yes\.[\s\S]*Bob: And the budget is/, 'the same words later are new, and the caption being written is in');
-  f.b.submitToolResult('d2', { text: 'ok' });
+  f.b.submitToolResult('d2', { text: 'ok', ccRecorded: true });
   assert.match(f.ask().args.ccMeetingDelta, /Bob: And the budget is/, 'an unfinished caption goes in each time until it is finished');
-  f.b.submitToolResult('d3', { text: 'ok' });
+  f.b.submitToolResult('d3', { text: 'ok', ccRecorded: true });
 
   // The tool call itself refused: nothing pending is left behind, and its lines come again.
   writeFileSync(join(dir, 'captions-live.json'), '{"rows":[]}');
@@ -109,9 +109,54 @@ test('what is being said now goes in; a line said twice is two lines; a consult 
   f.b.req.onToolCall = () => Promise.reject(new Error('down'));
   f.ask();
   await new Promise(r => setImmediate(r));
-  assert.equal(f.b.consultPending.size, 0);
+  assert.equal([...f.b.consultRecord({ meetingId: 'm1' }).pending.keys()].length, 0);
   f.b.req.onToolCall = t => f.tools.push(t);
   assert.match(f.ask().args.ccMeetingDelta, /Carol: Shipping on Monday/);
+  f.b.close();
+});
+
+test('lines count only when OpenClaw recorded the consult', () => {
+  const dir = mkdtempSync(join(process.env.HOME, 'delta-'));
+  caption(dir, 1, 'Alice', 'First point.');
+  const f = bridge(dir);
+  f.ask(); f.b.submitToolResult('d1', { text: 'busy, try again' });
+  assert.equal(f.ask().args.ccMeetingDelta, undefined, 'an answer OpenClaw did not record (a refusal, no patch): nothing delivered');
+  f.b.submitToolResult('d2', { text: 'ok', ccRecorded: true });
+  caption(dir, 2, 'Bob', 'Second point.');
+  f.ask(); f.b.submitToolResult('d3', { text: 'ok' });
+  const d = f.ask().args.ccMeetingDelta;
+  assert.match(d, /Bob: Second point/, 'the unrecorded consult\'s lines are sent again');
+  assert.doesNotMatch(d, /First point/);
+  f.b.close();
+});
+
+test('a consult the next voice session takes over counts there', () => {
+  const dir = mkdtempSync(join(process.env.HOME, 'delta-'));
+  caption(dir, 1, 'Alice', 'First point.');
+  const f = bridge(dir);
+  f.ask(); f.b.close();
+  // The answer reaches the next session of the meeting (adopted, or a late result).
+  const g = bridge(dir);
+  g.b.submitToolResult('d1', { text: 'ok', ccRecorded: true });
+  caption(dir, 2, 'Bob', 'Second point.');
+  const d = g.ask().args.ccMeetingDelta;
+  assert.match(d, /Bob: Second point/);
+  assert.doesNotMatch(d, /First point/);
+  g.b.close();
+});
+
+test('a consult past the voice\'s time limit still counts when its answer comes', () => {
+  const dir = mkdtempSync(join(process.env.HOME, 'delta-'));
+  caption(dir, 1, 'Alice', 'First point.');
+  const f = bridge(dir);
+  f.ask();
+  f.b.timeout(f.b.jobs.get('d1'));
+  f.b.submitToolResult('d1', { text: 'late', ccRecorded: true });
+  f.b.settle('d1');  // the grace after a timeout
+  caption(dir, 2, 'Bob', 'Second point.');
+  const d = f.ask().args.ccMeetingDelta;
+  assert.match(d, /Bob: Second point/);
+  assert.doesNotMatch(d, /First point/);
   f.b.close();
 });
 
@@ -142,7 +187,9 @@ test('a phone consult carries no meeting and no delta', () => {
 
 // ---- the patched OpenClaw consult: which of the two it uses ----
 
-const patched = execFileSync('python3', ['-c', `
+const upstream = process.env.MEET_UPSTREAM || '/tmp/meet-upstream';
+const noUpstream = existsSync(join(upstream, 'host/package')) ? false : 'needs the pinned host archive in MEET_UPSTREAM';
+const patched = noUpstream ? '' : execFileSync('python3', ['-c', `
 import importlib.util, shutil, sys, tempfile, contextlib, io
 from pathlib import Path
 s = importlib.util.spec_from_file_location('p', 'roles/controlclaw/files/meeting-runtime-patch.py'); m = importlib.util.module_from_spec(s); s.loader.exec_module(m)
@@ -155,7 +202,7 @@ with tempfile.TemporaryDirectory() as d:
     with contextlib.redirect_stdout(io.StringIO()): m.patch(root / 'host', root / 'plugin')
     spec = [p for p in m.PATCHES if 'realtime-session-harness' in p['path']][0]
     print((root / 'host' / spec['path']).read_text())
-`, process.env.MEET_UPSTREAM || '/tmp/meet-upstream'], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
+`, upstream], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
 
 function patchedFunctions() {
   const start = patched.indexOf('/** ControlClaw (consult-delta)');
@@ -165,9 +212,11 @@ function patchedFunctions() {
   return runInNewContext(`${patched.slice(start, end)}; ({ ccMeetingContextChoice, ccMeetingContextRecord })`, {});
 }
 
-test('the patched prompt is built from the choice, and the record follows an answered consult', () => {
+test('the patched prompt is built from the choice, and the record follows an answered consult', { skip: noUpstream }, () => {
   assert.match(patched, /args: ccMeetingContext\.args,\n\t+transcript: ccMeetingContext\.transcript,/);
-  assert.match(patched, /assertRealtimeVoiceConsultNotInterrupted\(abortSignal, result\.meta\);\n\t+ccMeetingContextRecord\(params, agentId, storePath, ccMeetingContext\);/);
+  assert.match(patched, /assertRealtimeVoiceConsultNotInterrupted\(abortSignal, result\.meta\);\n\t+const ccRecorded = ccMeetingContextRecord\(params, agentId, storePath, ccMeetingContext\) \? \{ ccRecorded: true \} : \{\};/);
+  // Every answer of the run says whether it was recorded.
+  assert.equal(patched.match(/\.\.\.ccRecorded\n/g)?.length, 3);
 });
 
 const KEY = 'agent:main:subagent:google-meet:meet_1';
@@ -178,7 +227,7 @@ const consult = (args, transcript = []) => ({ sessionKey: KEY, args, transcript,
 const full = 'RULES\n\nTIME\n\nThe meeting so far, from its captions:\nA\nB';
 const delta = 'RULES\n\nTIME\n\nMore of the meeting since your last answer:\nC';
 
-test('first, later, reset, compaction, restart', () => {
+test('first, later, reset, compaction, restart', { skip: noUpstream }, () => {
   const { ccMeetingContextChoice: choose, ccMeetingContextRecord: record } = patchedFunctions();
   const store = { current: { sessionId: 's1', compactionCount: 0 } };
   const answered = (p, c) => record({ ...p, agentRuntime: runtime(store) }, 'main', '/store', c);
@@ -204,6 +253,20 @@ test('first, later, reset, compaction, restart', () => {
   c = choose(p, store.current);
   assert.deepEqual(c.transcript, [{ role: 'assistant', text: 'let me check' }]);
   answered(p, c);
+
+  // The window moved on: an old line sliding out does not hide the same words said again.
+  const window1 = [{ role: 'user', text: 'yes' }, { role: 'user', text: 'the budget' }, { role: 'assistant', text: 'let me check' }];
+  p = consult({ question: 'q2c', context: full }, window1);
+  c = choose(p, store.current); answered(p, c);
+  const window2 = [{ role: 'user', text: 'the budget' }, { role: 'assistant', text: 'let me check' }, { role: 'user', text: 'yes' }];
+  p = consult({ question: 'q2d', context: full, ccMeetingDelta: delta }, window2);
+  c = choose(p, store.current);
+  assert.deepEqual(c.transcript, [{ role: 'user', text: 'yes' }]);
+  answered(p, c);
+  // No overlap at all: every line is new.
+  const window3 = [{ role: 'user', text: 'something else' }];
+  p = consult({ question: 'q2e', context: full, ccMeetingDelta: delta }, window3);
+  assert.deepEqual(choose(p, store.current).transcript, window3);
 
   // Reset: a new session id. The whole meeting, and the full voice lines.
   store.current = { sessionId: 's2', compactionCount: 0 };
@@ -239,7 +302,17 @@ test('first, later, reset, compaction, restart', () => {
   assert.equal(fresh.ccMeetingContextChoice(consult({ question: 'q', context: full, ccMeetingDelta: delta }), { sessionId: 's2', compactionCount: 2 }).used, false);
 });
 
-test('only meeting consults: another surface keeps its args, whatever it carries', () => {
+test('a history-turn limit on the subagent key: no delta', { skip: noUpstream }, () => {
+  const { ccMeetingContextChoice: choose, ccMeetingContextRecord: record } = patchedFunctions();
+  const store = { current: { sessionId: 's1', compactionCount: 0 } };
+  const p = { ...consult({ question: 'q', context: full }), agentRuntime: runtime(store) };
+  assert.equal(record(p, 'main', '/store', choose(p, store.current)), true);
+  const later = { ...consult({ question: 'q2', context: full, ccMeetingDelta: delta }), cfg: { channels: { subagent: { historyLimit: 5 } } } };
+  assert.equal(choose(later, store.current).used, false);
+  assert.equal(choose({ ...later, cfg: {} }, store.current).used, true);
+});
+
+test('only meeting consults: another surface keeps its args, whatever it carries', { skip: noUpstream }, () => {
   const { ccMeetingContextChoice: choose, ccMeetingContextRecord: record } = patchedFunctions();
   const store = { current: { sessionId: 's1', compactionCount: 0 } };
   const p = { sessionKey: 'agent:main:subagent:talk:x', args: { question: 'q', context: 'C', ccMeetingDelta: 'D' }, transcript: [], logger: { info: () => {} }, agentRuntime: runtime(store) };
