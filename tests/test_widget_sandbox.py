@@ -78,6 +78,8 @@ class Claim(unittest.TestCase):
         script = (ROLE / "files/cc-pool-local.cjs").read_text()
         self.assertIn('const sandboxAncestors = `"frame-ancestors https://${config.hostname}"`;', script)
         self.assertIn('sandboxAncestors, `"frame-ancestors https://${config.hostname} https://${vars.handle_hostname}"`', script)
+        # A sandbox site without that line is refused loudly, not claimed with widgets broken on the handle.
+        self.assertIn("if (source.includes(`\\nsandbox.${config.hostname} {`) && !source.includes(sandboxAncestors)) throw Error(", script)
 
 
 class OpenClawConfig(unittest.TestCase):

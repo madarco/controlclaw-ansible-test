@@ -117,6 +117,10 @@ function activate(vars) {
     if (!source.includes(`\n${config.hostname} {`)) throw Error('Caddy primary hostname missing');
     // The widget sandbox may be framed by the dashboard on its new name too (Caddyfile.j2, sandbox.<host>).
     const sandboxAncestors = `"frame-ancestors https://${config.hostname}"`;
+    // A Caddyfile with the sandbox site but not that line would leave the dashboard on its handle
+    // unable to frame its widgets, silently: refuse instead. A pool image from before the sandbox
+    // site has neither, and claims as it did.
+    if (source.includes(`\nsandbox.${config.hostname} {`) && !source.includes(sandboxAncestors)) throw Error('Caddy sandbox frame-ancestors missing');
     write(path, source.replace(`\n${config.hostname} {`, `\n${config.hostname}, ${vars.handle_hostname} {`).replace(
       '# Pool handle Origin rewrite (installed at claim).',
       `# Pool handle Origin rewrite (installed at claim).\n            header_up Origin https://${config.hostname}`).replace(
