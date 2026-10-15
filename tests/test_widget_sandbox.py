@@ -60,6 +60,11 @@ class SandboxSite(unittest.TestCase):
         claimed = site(render("mjhtest.ccl.bot"), f"sandbox.{HOST}")
         self.assertIn(f'"frame-ancestors https://{HOST} https://mjhtest.ccl.bot"', claimed)
 
+    def test_the_shipped_site_gets_a_public_certificate(self):
+        # ACME (Let's Encrypt, then ZeroSSL) like the agent's own name; never the local CA used in a test.
+        self.assertNotIn("tls internal", render())
+        self.assertNotIn("tls ", self.sandbox)
+
     def test_public_only_the_two_renderer_bundles_everything_else_404(self):
         self.assertIn("path /__openclaw__/a2ui/a2ui.bundle.js /__openclaw__/a2ui/a2ui-v0.9.bundle.js\n", self.sandbox)
         self.assertNotIn("forward_auth", self.handle("@renderer"))
