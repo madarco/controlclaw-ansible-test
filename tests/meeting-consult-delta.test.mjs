@@ -13,10 +13,10 @@ import { LiveBridge } from '../roles/controlclaw/files/meeting-voice/live.js';
 
 // ---- live.js: what each consult carries ----
 
-function bridge(dir) {
+function bridge(dir, meetingId = 'm1') {
   const tools = [];
   const req = { providerConfig: { provider: 'gateway', model: 'openai/gpt-live-1', surface: 'meeting', wake: { enabled: false, words: ['Jarvis'] } }, onAudio: () => {}, onToolCall: t => tools.push(t), onTranscript: () => {}, onClose: () => {}, onClearAudio: () => {} };
-  const b = new LiveBridge(req, { metric: () => {}, voiceDir: dir, lease: () => ({ at: '', owner: null, meetingId: 'm1', full: false, present: false }) });
+  const b = new LiveBridge(req, { metric: () => {}, voiceDir: dir, lease: () => ({ at: '', owner: null, meetingId, full: false, present: false }) });
   b.ws = { readyState: 1, bufferedAmount: 0, send: () => {}, terminate: () => {} }; b.ready = true;
   let n = 0;
   const ask = (q = 'Jarvis, a question?') => {
@@ -28,6 +28,7 @@ function bridge(dir) {
 }
 const at = s => new Date(Date.parse('2026-10-15T10:00:00Z') + s * 1000).toISOString();
 const caption = (dir, s, speaker, text) => appendFileSync(join(dir, 'captions.jsonl'), JSON.stringify({ at: at(s), speaker, text }) + '\n');
+const live = (dir, rows) => writeFileSync(join(dir, 'captions-live.json'), JSON.stringify({ rows: rows.map(([s, speaker, text]) => ({ at: at(s), speaker, text })) }));
 const own = (dir, s, text) => appendFileSync(join(dir, 'meeting.jsonl'), JSON.stringify({ at: at(s), kind: 'line', role: 'assistant', text }) + '\n');
 const rules = ctx => ctx.slice(0, ctx.indexOf('\n\n'));
 
@@ -48,7 +49,7 @@ test('the first consult carries the whole meeting; a later one only what finishe
   const delta = second.ccMeetingDelta;
   assert.match(delta, /More of the meeting since your last answer[\s\S]*Carol: Marketing wants a demo video\./);
   assert.doesNotMatch(delta, /launch moved to Thursday|twelve thousand/, 'not what the session already has');
-  assert.doesNotMatch(delta, /Jarvis: The launch is on Thursday/, 'nor the agent\'s own line (OpenClaw\'s recent voice lines have it)');
+  assert.match(delta, /Jarvis: The launch is on Thursday/, 'the agent\'s own line too: OpenClaw\'s recent voice lines keep only the last few');
   assert.equal(rules(delta), rules(second.context), 'the rules come first and unchanged, so they cache');
   assert.match(rules(delta), /^How to handle this request/);
 
@@ -71,15 +72,57 @@ test('a failed consult is not counted, a restart starts over, a long gap sends t
   assert.match(after, /Second point[\s\S]*Third point/, 'what the failed consult carried is sent again');
   f.b.close();
 
-  // A new voice session (a restart of the voice or the gateway): nothing known, the whole meeting.
+  // A new voice session of the same meeting (the next wake word, or after a pause): it goes on from
+  // what the meeting's earlier sessions delivered, as they share one consult session.
   const g = bridge(dir);
-  assert.equal(g.ask().args.ccMeetingDelta, undefined);
+  const next = g.ask().args.ccMeetingDelta;
+  assert.match(next, /Second point[\s\S]*Third point/, 'the unanswered consult of the last session is not counted');
+  assert.doesNotMatch(next, /First point/);
   g.b.submitToolResult('d1', { text: 'ok' });
+  // Another meeting in the same folder: nothing known.
+  const h = bridge(dir, 'm2');
+  assert.equal(h.ask().args.ccMeetingDelta, undefined);
+  h.b.close();
   for (let i = 0; i < 300; i++) caption(dir, 10 + i, 'Dave', `A long stretch of meeting, line ${i}, with enough words to add up quickly.`);
   const long = g.ask().args;
   assert.equal(long.ccMeetingDelta, undefined, 'more than the delta limit: the whole meeting instead');
   assert.match(long.context, /The meeting so far/);
   g.b.close();
+});
+
+test('what is being said now goes in; a line said twice is two lines; a consult that never ran is not counted', async () => {
+  const dir = mkdtempSync(join(process.env.HOME, 'delta-'));
+  caption(dir, 1, 'Alice', 'Yes.');
+  const f = bridge(dir);
+  f.ask(); f.b.submitToolResult('d1', { text: 'ok' });
+  caption(dir, 70, 'Alice', 'Yes.');
+  live(dir, [[75, 'Bob', 'And the budget is']]);
+  const d = f.ask().args.ccMeetingDelta;
+  assert.match(d, /Alice: Yes\.[\s\S]*Bob: And the budget is/, 'the same words later are new, and the caption being written is in');
+  f.b.submitToolResult('d2', { text: 'ok' });
+  assert.match(f.ask().args.ccMeetingDelta, /Bob: And the budget is/, 'an unfinished caption goes in each time until it is finished');
+  f.b.submitToolResult('d3', { text: 'ok' });
+
+  // The tool call itself refused: nothing pending is left behind, and its lines come again.
+  writeFileSync(join(dir, 'captions-live.json'), '{"rows":[]}');
+  caption(dir, 80, 'Carol', 'Shipping on Monday.');
+  f.b.req.onToolCall = () => Promise.reject(new Error('down'));
+  f.ask();
+  await new Promise(r => setImmediate(r));
+  assert.equal(f.b.consultPending.size, 0);
+  f.b.req.onToolCall = t => f.tools.push(t);
+  assert.match(f.ask().args.ccMeetingDelta, /Carol: Shipping on Monday/);
+  f.b.close();
+});
+
+test('no captions yet: what the voice just said is the context', () => {
+  const dir = mkdtempSync(join(process.env.HOME, 'delta-'));
+  const f = bridge(dir);
+  f.b.event({ type: 'session.output_transcript.delta', delta: 'Let me look that up.' });
+  const ctx = f.ask().args.context;
+  assert.match(ctx, /The voice assistant just said: Let me look that up\./);
+  assert.doesNotMatch(ctx, /The meeting so far/);
+  f.b.close();
 });
 
 test('a phone consult carries no meeting and no delta', () => {
@@ -153,6 +196,13 @@ test('first, later, reset, compaction, restart', () => {
   c = choose(p, store.current);
   assert.equal(c.used, true); assert.equal(c.args.context, delta); assert.equal('ccMeetingDelta' in c.args, false);
   assert.deepEqual(c.transcript, [{ role: 'user', text: 'and the budget' }]);
+  answered(p, c);
+
+  // A line said again ("yes") is a new turn, not one already carried.
+  const voice3 = [...voice2, { role: 'assistant', text: 'let me check' }];
+  p = consult({ question: 'q2b', context: full, ccMeetingDelta: delta }, voice3);
+  c = choose(p, store.current);
+  assert.deepEqual(c.transcript, [{ role: 'assistant', text: 'let me check' }]);
   answered(p, c);
 
   // Reset: a new session id. The whole meeting, and the full voice lines.
