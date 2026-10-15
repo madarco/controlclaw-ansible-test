@@ -115,9 +115,12 @@ function activate(vars) {
     const path = '/etc/caddy/Caddyfile';
     const source = read(path);
     if (!source.includes(`\n${config.hostname} {`)) throw Error('Caddy primary hostname missing');
+    // The widget sandbox may be framed by the dashboard on its new name too (Caddyfile.j2, sandbox.<host>).
+    const sandboxAncestors = `"frame-ancestors https://${config.hostname}"`;
     write(path, source.replace(`\n${config.hostname} {`, `\n${config.hostname}, ${vars.handle_hostname} {`).replace(
       '# Pool handle Origin rewrite (installed at claim).',
-      `# Pool handle Origin rewrite (installed at claim).\n            header_up Origin https://${config.hostname}`));
+      `# Pool handle Origin rewrite (installed at claim).\n            header_up Origin https://${config.hostname}`).replace(
+      sandboxAncestors, `"frame-ancestors https://${config.hostname} https://${vars.handle_hostname}"`));
     cmd(['systemctl', 'reload', 'caddy']);
   }
 }
