@@ -498,7 +498,8 @@
            openclaw_gateway_current.publicOrigin | default('') == 'https://' ~ vm_hostname and
            openclaw_gateway_current.trustedProxies | default([]) == ['127.0.0.1'] and
            openclaw_gateway_current.controlUi.allowedOrigins | default([]) == ['https://' ~ vm_hostname] and
-           openclaw_mcp_apps_current.sandboxOrigin | default('') == 'https://sandbox.' ~ vm_hostname)) }}
+           openclaw_mcp_apps_current.sandboxOrigin | default('') ==
+             (('https://sandbox.' ~ vm_hostname) if widget_sandbox_enabled | default(false) | bool else ''))) }}
   vars:
     openclaw_gateway_current: >-
       {{ (openclaw_config_raw.content | default('') | b64decode | from_json).gateway
@@ -580,8 +581,14 @@
     # https://<host>:18790, which nothing routes ("Widget sandbox host is unavailable"); OpenClaw
     # refuses one equal to the dashboard's. Caddy serves this name (Caddyfile.j2), signed in like the
     # dashboard. `mcp` is merged, so the vm-agent's mcp.servers stay as they are.
+    # Behind widget_sandbox_enabled (defaults/main.yml); off, one written earlier is cleared (null).
     openclaw_sandbox_json: >-
-      {{ (',"mcp":{"apps":{"sandboxOrigin":"https://sandbox.' ~ vm_hostname ~ '"}}') if vm_hostname is defined else '' }}
+      {{ (',"mcp":{"apps":{"sandboxOrigin":"https://sandbox.' ~ vm_hostname ~ '"}}')
+           if (vm_hostname is defined and widget_sandbox_enabled | default(false) | bool)
+         else (',"mcp":{"apps":{"sandboxOrigin":null}}' if openclaw_sandbox_set | bool else '') }}
+    openclaw_sandbox_set: >-
+      {{ ((((openclaw_config_raw.content | default('') | b64decode | from_json).mcp | default({})).apps | default({})).sandboxOrigin | default('')) | length > 0
+         if openclaw_config_raw.content is defined else false }}
     openclaw_desktop_json: >-
       {{ (',"desktop":{"host":{"enabled":true,"port":' ~ browser_desktop_vnc_port | int ~ ',"passwordFile":"' ~ openclaw_desktop_password_file ~ '"}}')
          if openclaw_desktop_expected | bool else ',"desktop":{"host":{"enabled":false}}' }}

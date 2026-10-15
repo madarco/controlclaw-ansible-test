@@ -120,6 +120,7 @@
         }
     }
 }
+{% if widget_sandbox_enabled | default(false) | bool %}
 
 # The OpenClaw widget sandbox (mcp.apps.sandboxOrigin, set in tasks/openclaw.yml). Widget HTML runs
 # in an iframe on this host so that it never shares the dashboard's origin; OpenClaw refuses a sandbox
@@ -178,3 +179,4 @@ sandbox.{{ vm_hostname }} {
         respond 404
     }
 }
+{% endif %}

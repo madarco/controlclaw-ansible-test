@@ -4,8 +4,11 @@ is told.
 
 Run from the repo root: python3 -m unittest tests/test_widget_sandbox.py
 """
+import json
 import pathlib
 import re
+import subprocess
+import tempfile
 import unittest
 import urllib.parse
 
@@ -15,13 +18,31 @@ ROLE = pathlib.Path(__file__).resolve().parent.parent / "roles/controlclaw"
 HOST = "pool-ab12.ccl.bot"
 
 
-def render(alias=""):
-    env = jinja2.Environment(loader=jinja2.FileSystemLoader(str(ROLE / "templates")), keep_trailing_newline=True)
+VARS = dict(caddy_acme_email="ops@example.com", config_api_url="https://controlclaw.com/api/vm-agent/config",
+            browser_novnc_port=6080, openclaw_gateway_port=18789, openclaw_sandbox_port=18790, luks_locked_port=3101)
+
+
+def render(alias="", enabled=True, template=None):
+    # As Ansible renders templates: trim_blocks on.
+    env = jinja2.Environment(loader=jinja2.FileSystemLoader(str(ROLE / "templates")), keep_trailing_newline=True, trim_blocks=True)
     env.filters["urlsplit"] = lambda v, part: getattr(urllib.parse.urlsplit(v), part)
-    return env.get_template("Caddyfile.j2").render(
-        vm_hostname=HOST, cc_handle_alias=alias, caddy_acme_email="ops@example.com",
-        config_api_url="https://controlclaw.com/api/vm-agent/config", browser_novnc_port=6080,
-        openclaw_gateway_port=18789, openclaw_sandbox_port=18790, luks_locked_port=3101)
+    # Ansible's `bool` filter.
+    env.filters["bool"] = lambda v: v if isinstance(v, bool) else str(v).strip().lower() in ("yes", "on", "1", "true", "y")
+    t = env.from_string(template) if template else env.get_template("Caddyfile.j2")
+    return t.render(vm_hostname=HOST, cc_handle_alias=alias, widget_sandbox_enabled=enabled, **VARS)
+
+
+def claim(caddyfile, handle="mjhtest.ccl.bot"):
+    """cc-pool-local.cjs's own claimCaddyfile, run by node on a rendered Caddyfile in a temp dir."""
+    with tempfile.TemporaryDirectory() as d:
+        path = pathlib.Path(d) / "Caddyfile"
+        path.write_text(caddyfile)
+        script = (f"const fs=require('fs');const {{claimCaddyfile}}=require({json.dumps(str(ROLE / 'files/cc-pool-local.cjs'))});"
+                  f"fs.writeFileSync({json.dumps(str(path))},claimCaddyfile(fs.readFileSync({json.dumps(str(path))},'utf8'),{json.dumps(HOST)},{json.dumps(handle)}))")
+        run = subprocess.run(["node", "-e", script], capture_output=True, text=True)
+        if run.returncode:
+            raise RuntimeError(run.stderr.strip() or "node failed")
+        return path.read_text()
 
 
 def site(caddyfile, name):
@@ -76,22 +97,48 @@ class SandboxSite(unittest.TestCase):
 
 
 class Claim(unittest.TestCase):
-    def test_the_claim_adds_the_handle_to_the_sandbox_ancestors(self):
-        # cc-pool-local.cjs edits the rendered Caddyfile by text: the string it looks for is there once.
-        pool = render()
-        self.assertEqual(pool.count(f'"frame-ancestors https://{HOST}"'), 1)
-        script = (ROLE / "files/cc-pool-local.cjs").read_text()
-        self.assertIn('const sandboxAncestors = `"frame-ancestors https://${config.hostname}"`;', script)
-        self.assertIn('sandboxAncestors, `"frame-ancestors https://${config.hostname} https://${vars.handle_hostname}"`', script)
-        # A sandbox site without that line is refused loudly, not claimed with widgets broken on the handle.
-        self.assertIn("if (source.includes(`\\nsandbox.${config.hostname} {`) && !source.includes(sandboxAncestors)) throw Error(", script)
+    def test_the_claim_adds_the_handle_to_the_site_and_the_sandbox_ancestors(self):
+        claimed = claim(render())
+        self.assertIn(f"\n{HOST}, mjhtest.ccl.bot {{", claimed)
+        self.assertIn(f"header_up Origin https://{HOST}", claimed)
+        self.assertIn(f'"frame-ancestors https://{HOST} https://mjhtest.ccl.bot"', site(claimed, f"sandbox.{HOST}"))
+        # The same as rendering with the handle from the start (a later reprovision).
+        self.assertEqual(site(claimed, f"sandbox.{HOST}"), site(render("mjhtest.ccl.bot"), f"sandbox.{HOST}"))
+
+    def test_with_the_switch_off_the_claim_is_what_it_was(self):
+        claimed = claim(render(enabled=False))
+        self.assertIn(f"\n{HOST}, mjhtest.ccl.bot {{", claimed)
+        self.assertNotIn("sandbox.", claimed)
+
+    def test_a_sandbox_site_it_cannot_edit_is_refused(self):
+        broken = render().replace(f'"frame-ancestors https://{HOST}"', '"frame-ancestors https://elsewhere.example"')
+        with self.assertRaisesRegex(RuntimeError, "Caddy sandbox frame-ancestors missing"):
+            claim(broken)
+
+
+class Switch(unittest.TestCase):
+    def test_off_by_default(self):
+        self.assertIn("\nwidget_sandbox_enabled: false\n", (ROLE / "defaults/main.yml").read_text())
+
+    def test_off_the_caddyfile_is_the_one_before_this_change(self):
+        before = subprocess.run(["git", "show", "4059775974f822631d6e63e1935af16740f40dab:roles/controlclaw/templates/Caddyfile.j2"],
+                                cwd=ROLE.parent.parent, capture_output=True, text=True)
+        if before.returncode:
+            self.skipTest("the 1.19.1 commit is not in this clone")
+        for alias in ("", "mjhtest.ccl.bot"):
+            self.assertEqual(render(alias, enabled=False), render(alias, template=before.stdout), alias)
+
+    def test_off_no_sandbox_origin_and_one_set_earlier_is_cleared(self):
+        tasks = (ROLE / "tasks/openclaw.yml").read_text()
+        self.assertIn("if (vm_hostname is defined and widget_sandbox_enabled | default(false) | bool)", tasks)
+        self.assertIn("""else (',"mcp":{"apps":{"sandboxOrigin":null}}' if openclaw_sandbox_set | bool else '') }}""", tasks)
+        self.assertIn("(('https://sandbox.' ~ vm_hostname) if widget_sandbox_enabled | default(false) | bool else '')", tasks)
 
 
 class OpenClawConfig(unittest.TestCase):
     def test_the_sandbox_origin_is_written_and_checked(self):
         tasks = (ROLE / "tasks/openclaw.yml").read_text()
         self.assertIn("""',"mcp":{"apps":{"sandboxOrigin":"https://sandbox.' ~ vm_hostname ~ '"}}'""", tasks)
-        self.assertIn("openclaw_mcp_apps_current.sandboxOrigin | default('') == 'https://sandbox.' ~ vm_hostname", tasks)
         self.assertIn("{{ openclaw_sandbox_json }}}'", tasks)
 
 
