@@ -23,7 +23,7 @@ import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { clean, displayName, ownerRoute } from './actions.js';
-import { meetingLease } from './record.js';
+import { meetingLease, voiceRecord } from './record.js';
 const OPENCLAW = '/usr/bin/openclaw';
 export const MAX_RUNNING = 3;
 export const MAX_TASKS = 10;
@@ -31,6 +31,8 @@ export const MAX_FOLLOW_UPS = 10;
 const TIMEOUT_SECONDS = 900;
 const DIR = () => join(process.env.HOME || homedir(), '.openclaw', 'cc-voice');
 const MEETING_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+/** A task's session, from the meeting's id and the task's number only: never from the tasks file. */
+const sessionKey = (id, n) => `agent:main:meeting-${id.slice(0, 8)}-task-${n}`;
 
 /** What the run is told. The request and the meeting are speech: who asked is untrusted, the rest is context. */
 export function taskMessage({ n, task, from, meeting }) {
@@ -130,17 +132,33 @@ export function createTasks(deps = {}) {
     });
   /**
    * Runs a task (`k` unset) or a follow-up in `session`, once what is ahead of it in its lane has
-   * ended (`after`), then keeps the result and tells the room.
+   * ended (`after`), then keeps the result and tells the room. `after` returns false when the
+   * follow-up may no longer run (Full agent turned off, or the meeting is over meanwhile): it is
+   * then left for the owner. The lane's place is given back whatever happens.
    */
   const launch = ({ lease, id, n, k, session, message, who, text, key, lane, after }) => {
-    const done = (after ? lane.tail.then(() => { after(); return agentRun(session, message); }) : agentRun(session, message)).then(({ ok, said }) => {
-      leaveLane(key);
-      const fields = { state: ok ? 'done' : 'failed', endedAt: new Date(now()).toISOString(), result: said }, of = k ? { n, k } : { n };
-      if (!(k ? updateFollowUp(id, n, k, fields) : update(id, n, fields))) return { ...of, ok, deleted: true };
-      deliver(`Task ${n}${k ? `, follow-up ${k}` : ''}${who ? `, asked by ${who}` : ''} ("${text}"), ${ok ? 'is done' : 'did not finish'}: ${said} Tell the room in one or two short sentences.`, lease.owner, id);
-      return { ...of, ok };
-    });
-    lane.tail = done.catch(() => {});
+    const of = k ? { n, k } : { n };
+    const keep = fields => (k ? updateFollowUp(id, n, k, fields) : update(id, n, fields));
+    const done = (async () => {
+      try {
+        if (after) {
+          await lane.tail;
+          if (!after()) {
+            rmSync(message, { force: true });
+            if (!keep({ state: 'left', endedAt: new Date(now()).toISOString(), result: 'Not run: Full agent was turned off before it could start. Left for the owner.' })) return { ...of, ok: false, deleted: true };
+            voiceRecord('meeting', dir).action('request', { text, from: who, suggestedAllowed: false });
+            deliver(`Task ${n}, follow-up ${k}${who ? `, asked by ${who}` : ''} ("${text}"), was not run: Full agent was turned off before it could start, so it is left for the owner. Tell the room in one short sentence.`, lease.owner, id);
+            return { ...of, ok: false, left: true };
+          }
+        }
+        const { ok, said } = await agentRun(session, message);
+        if (!keep({ state: ok ? 'done' : 'failed', endedAt: new Date(now()).toISOString(), result: said })) return { ...of, ok, deleted: true };
+        deliver(`Task ${n}${k ? `, follow-up ${k}` : ''}${who ? `, asked by ${who}` : ''} ("${text}"), ${ok ? 'is done' : 'did not finish'}: ${said} Tell the room in one or two short sentences.`, lease.owner, id);
+        return { ...of, ok };
+      // Nothing waits on `done` in the gateway: a failure here must not become an unhandled rejection.
+      } catch { return { ...of, ok: false, error: true }; } finally { leaveLane(key); }
+    })();
+    lane.tail = done;
     return done;
   };
   /**
@@ -163,8 +181,11 @@ export function createTasks(deps = {}) {
     // `startedAt`: when it was asked (its message holds the meeting up to then), also for one that waits.
     update(id, n, { followUps: [...ups, { k, from: who, text, state: queued ? 'queued' : 'running', startedAt: new Date(now()).toISOString() }] });
     const lane = enter(key);
-    const done = launch({ lease, id, n, k, session: parent.session, message, who, text, key, lane, ...(queued ? { after: () => updateFollowUp(id, n, k, { state: 'running' }) } : {}) });
-    return { ok: true, n, k, queued, session: parent.session, done };
+    const session = sessionKey(id, n);
+    // Waiting for its task: it runs only if this meeting still has Full agent when its turn comes.
+    const after = () => { const current = meetingLease(dir); if (current.full !== true || current.meetingId !== id) return false; updateFollowUp(id, n, k, { state: 'running' }); return true; };
+    const done = launch({ lease, id, n, k, session, message, who, text, key, lane, ...(queued ? { after } : {}) });
+    return { ok: true, n, k, queued, session, done };
   };
   return {
     /**
@@ -183,7 +204,7 @@ export function createTasks(deps = {}) {
       if (running >= MAX_RUNNING) return { ok: false, reason: 'busy' };
       const n = tasks.reduce((m, t) => Math.max(m, Number(t.n) || 0), 0) + 1;
       const text = clean(task, 300), who = displayName(from);
-      const session = `agent:main:meeting-${id.slice(0, 8)}-task-${n}`;
+      const session = sessionKey(id, n);
       write(id, [...tasks, { n, from: who, text, session, state: 'running', startedAt: new Date(now()).toISOString() }]);
       const message = join(dir, 'tasks', `${id}-${n}.md`);
       try { writeFileSync(message, taskMessage({ n, task: text, from: who, meeting }), { mode: 0o600 }); }

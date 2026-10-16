@@ -51,6 +51,7 @@ const ACK_DELAY = 300;
 const SINCE_MARGIN = 30000;
 // Two delegations this close with no new words between them are one request (the model asks twice).
 const ACK_SAME_REQUEST = 10000;
+const TASKS_OFF = "This meeting's tasks (kept by ControlClaw): Full agent is off now; this meeting no longer runs tasks or follow-ups.";
 const ACK = 'Acknowledge the request now, in one or two words only ("ok", "on it", "let me check"). The answer comes later; say nothing else now.';
 const LOOKUP_TIMEOUT = 30000;
 const STILL_CHECKING_AFTER = 8000;
@@ -426,8 +427,9 @@ export class LiveBridge {
     // changes: the time and who spoke, then the meeting (OpenClaw puts the request last).
     const rules = consultRules(this.config.reminders !== false, new Date(), lease.full === true, lease.present === true);
     // Full agent: the meeting's tasks, so that a request about one continues it (tasks.js).
+    // Turned off in a meeting that had tasks: one line saying so, in place of the list (sent once, as a change).
     let tasks = '';
-    if (lease.full === true) try { tasks = taskList(this.tasks().list?.(lease.meetingId) ?? []); } catch { /* none */ }
+    try { const list = this.tasks().list?.(lease.meetingId) ?? []; tasks = lease.full === true ? taskList(list) : list.length ? TASKS_OFF : ''; } catch { /* none */ }
     const when = [consultTime(), speakerNote(this.speaker())].filter(Boolean).join('\n');
     const keys = lines.filter(l => l.final).map(l => l.key);
     const context = [rules, tasks, when, about].filter(Boolean).join('\n\n');

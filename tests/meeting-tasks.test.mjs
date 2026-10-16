@@ -336,3 +336,64 @@ test('a task that never ran cannot be continued: the request starts a new task; 
   assert.equal(g.file()[0].followUps[0].state, 'running'); assert.equal(g.file()[0].followUps[0].startedAt, asked);
   g.finish[1](reply('Red.')); await up.done;
 });
+
+test('a follow-up waiting for its task is not run once Full agent is off, or the meeting changed: left for the owner', async () => {
+  for (const change of [l => l({ meetingId: MEETING }), l => l({ meetingId: '1b9a3f43-5d0e-4c55-9d0c-3a1f2b4c5d6e', full: true })]) {
+    const f = fixture();
+    const said = [];
+    f.tasks.setSpeaker(text => { said.push(text); return true; });
+    const task = f.tasks.start({ task: 'Build the page', from: 'Bob' });
+    const up = f.tasks.start({ task: 'Make it red', from: 'Ann', continue: 1 });
+    assert.equal(up.queued, true);
+    change(f.lease);  // Full agent turned off (the lease loses `full`), or another meeting's lease
+    f.finish[0](reply('Built.')); await task.done;
+    assert.deepEqual(await up.done, { n: 1, k: 1, ok: false, left: true });
+    assert.equal(f.calls.filter(c => c.args[0] === 'agent').length, 1, 'the follow-up never ran');
+    assert.equal(f.file()[0].followUps[0].state, 'left');
+    assert.match(f.file()[0].followUps[0].result, /Left for the owner/);
+    assert.match(readFileSync(join(f.dir, 'meeting.jsonl'), 'utf8'), /"kind":"request".*Make it red/);
+    assert.equal(f.tasks.running(), 0);
+    assert.equal(existsSync(join(f.dir, 'tasks', `${MEETING}-1-1.md`)), false);
+  }
+});
+
+test('a follow-up runs in the session built from the meeting and the task number, whatever the tasks file says', async () => {
+  for (const session of ['agent:main:main', '--deliver', 'agent:main:meeting-0b9a3f43-task-1 --to x']) {
+    const f = fixture();
+    mkdirSync(join(f.dir, 'tasks'), { recursive: true });
+    writeFileSync(join(f.dir, 'tasks', `${MEETING}.json`), JSON.stringify([{ n: 1, text: 'Build it', session, state: 'done', startedAt: new Date().toISOString() }]));
+    const up = f.tasks.start({ task: 'Make it red', continue: 1 });
+    assert.equal(up.session, 'agent:main:meeting-0b9a3f43-task-1');
+    const run = f.calls.find(c => c.args[0] === 'agent');
+    assert.deepEqual(run.args.slice(0, 3), ['agent', '--session-key', 'agent:main:meeting-0b9a3f43-task-1']);
+    f.finish[0](reply('Red.')); await up.done;
+  }
+});
+
+test('a failure after the run (telling the room throws) still gives the lane\'s place back, and the run settles', async () => {
+  const f = fixture();
+  f.tasks.setSpeaker(() => { throw new Error('session gone'); });
+  const a = f.tasks.start({ task: 'Build it' });
+  const up = f.tasks.start({ task: 'Make it red', continue: 1 });
+  f.finish[0](reply('Built.'));
+  assert.deepEqual(await a.done, { n: 1, ok: false, error: true }, 'settled, never rejected');
+  await until(() => f.finish.length === 2);
+  f.finish[1](reply('Red.'));
+  assert.deepEqual(await up.done, { n: 1, k: 1, ok: false, error: true });
+  assert.equal(f.tasks.running(), 0);
+});
+
+test('Full agent turned off in a meeting with tasks: the consult is told the meeting no longer runs them', async () => {
+  const f = fixture();
+  const lease = { at: new Date().toISOString(), owner: OWNER, meetingId: MEETING, full: true };
+  const v = live(f.tasks);
+  v.bridge.deps.lease = () => lease;
+  await v.bridge.connect();
+  const ws = v.all[0];
+  const t = f.tasks.start({ task: 'Build the page' }); f.finish[0](reply('Built.')); await t.done;
+  lease.full = false; f.lease({ meetingId: MEETING });
+  ask(ws, 'd1');
+  assert.match(v.tools[0].args.context, /\n\nThis meeting's tasks \(kept by ControlClaw\): Full agent is off now; this meeting no longer runs tasks or follow-ups\.\n\n/);
+  assert.doesNotMatch(v.tools[0].args.context, /Build the page|CC_TASK/);
+  v.bridge.close();
+});
