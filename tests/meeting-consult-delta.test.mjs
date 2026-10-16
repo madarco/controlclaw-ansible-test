@@ -50,8 +50,9 @@ test('the first consult carries the whole meeting; a later one only what finishe
   assert.match(delta, /More of the meeting since your last answer[\s\S]*Carol: Marketing wants a demo video\./);
   assert.doesNotMatch(delta, /launch moved to Thursday|twelve thousand/, 'not what the session already has');
   assert.match(delta, /Jarvis: The launch is on Thursday/, 'the agent\'s own line too: OpenClaw\'s recent voice lines keep only the last few');
-  assert.equal(rules(delta), rules(second.context), 'the rules come first and unchanged, so they cache');
-  assert.match(rules(delta), /^How to handle this request/);
+  assert.match(rules(second.context), /^How to handle this request/, 'the whole meeting has the rules first');
+  assert.doesNotMatch(delta, /How to handle this request/, 'the rules are in the session already: not sent again');
+  assert.match(delta, /^The time now is /, 'the time and who spoke are in every consult');
 
   f.b.submitToolResult('d2', { text: 'ok', ccRecorded: true });
   const third = f.ask().args;
@@ -185,6 +186,97 @@ test('a phone consult carries no meeting and no delta', () => {
   b.close();
 });
 
+// ---- consult-rules: the rules and the task list only when they changed ----
+
+function leased(dir, lease, tasks) {
+  const tools = [];
+  const req = { providerConfig: { provider: 'gateway', model: 'openai/gpt-live-1', surface: 'meeting', wake: { enabled: false, words: ['Jarvis'] } }, onAudio: () => {}, onToolCall: t => tools.push(t), onTranscript: () => {}, onClose: () => {}, onClearAudio: () => {} };
+  const b = new LiveBridge(req, { metric: () => {}, voiceDir: dir, lease: () => lease, ...(tasks ? { tasks } : {}) });
+  b.ws = { readyState: 1, bufferedAmount: 0, send: () => {}, terminate: () => {} }; b.ready = true;
+  let n = 0;
+  const ask = () => { b.event({ type: 'session.input_transcript.delta', delta: 'Jarvis, a question?' }); b.event({ type: 'session.delegation.created', delegation: { id: `r${++n}` } }); return { id: `r${n}`, args: tools.at(-1).args }; };
+  return { b, ask };
+}
+const RULES = /How to handle this request \(from ControlClaw/;
+
+test('the rules: on the first consult and the whole meeting; a later one only when they changed', () => {
+  const dir = mkdtempSync(join(process.env.HOME, 'rules-'));
+  caption(dir, 1, 'Alice', 'Hello.');
+  const lease = { at: '', owner: null, meetingId: 'r1', full: false, present: false };
+  const f = leased(dir, lease);
+  let q = f.ask();
+  assert.match(q.args.context, RULES); assert.equal(q.args.ccMeetingDelta, undefined);
+  f.b.submitToolResult(q.id, { text: 'ok', ccRecorded: true });
+
+  q = f.ask();
+  assert.match(q.args.context, RULES, 'the whole meeting, for a session that turns out new, has them');
+  assert.doesNotMatch(q.args.ccMeetingDelta, RULES);
+  assert.match(q.args.ccMeetingDelta, /^The time now is .*\nName shown in the captions/, 'the time and who spoke stay in every consult');
+  f.b.submitToolResult(q.id, { text: 'ok', ccRecorded: true });
+
+  // Presenting turned on (the lease): the rules change, and are sent again, once.
+  lease.present = true;
+  q = f.ask();
+  assert.match(q.args.ccMeetingDelta, /^How to handle this request[\s\S]*CC_PRESENT/);
+  f.b.submitToolResult(q.id, { text: 'ok' });
+  q = f.ask();
+  assert.match(q.args.ccMeetingDelta, /CC_PRESENT/, 'not recorded by OpenClaw: sent again');
+  f.b.submitToolResult(q.id, { text: 'ok', ccRecorded: true });
+  assert.doesNotMatch(f.ask().args.ccMeetingDelta, RULES);
+  f.b.submitToolResult(`r${5}`, { text: 'ok', ccRecorded: true });
+
+  // Full agent turned off mid-meeting, reminders: the same.
+  lease.full = true;
+  q = f.ask(); assert.match(q.args.ccMeetingDelta, /CC_TASK/); f.b.submitToolResult(q.id, { text: 'ok', ccRecorded: true });
+  lease.full = false;
+  q = f.ask(); assert.match(q.args.ccMeetingDelta, /CC_NEEDS_OWNER/); assert.doesNotMatch(q.args.ccMeetingDelta, /CC_TASK/);
+  f.b.close();
+});
+
+test('the rules after a restart of this process: nothing known, the whole meeting with them', () => {
+  const dir = mkdtempSync(join(process.env.HOME, 'rules-'));
+  caption(dir, 1, 'Alice', 'Hello.');
+  const f = leased(dir, { at: '', owner: null, meetingId: 'r2', full: false, present: false });
+  const q = f.ask(); f.b.submitToolResult(q.id, { text: 'ok', ccRecorded: true }); f.b.close();
+  // A new meeting record (what a restart leaves): no delta, so OpenClaw gets the whole meeting and the rules.
+  const g = leased(dir, { at: '', owner: null, meetingId: 'r2-after-restart', full: false, present: false });
+  const first = g.ask().args;
+  assert.equal(first.ccMeetingDelta, undefined); assert.match(first.context, RULES);
+  g.b.close();
+});
+
+test('no captions: after a recorded consult the delta is offered too, with what the voice said and no rules', () => {
+  const dir = mkdtempSync(join(process.env.HOME, 'rules-'));
+  const f = leased(dir, { at: '', owner: null, meetingId: 'r3', full: false, present: false });
+  let q = f.ask(); f.b.submitToolResult(q.id, { text: 'ok', ccRecorded: true });
+  f.b.event({ type: 'session.output_transcript.delta', delta: 'Let me look.' });
+  q = f.ask();
+  assert.match(q.args.ccMeetingDelta, /^The time now is [^\n]*\n*[\s\S]*The voice assistant just said: Let me look\./);
+  assert.doesNotMatch(q.args.ccMeetingDelta, RULES);
+  f.b.close();
+});
+
+test('the meeting\'s tasks: listed for the consult in a Full agent meeting, again only when they changed', () => {
+  const dir = mkdtempSync(join(process.env.HOME, 'rules-'));
+  caption(dir, 1, 'Alice', 'Hello.');
+  let list = [];
+  const tasks = { list: () => list, start: () => ({ ok: false, reason: 'failed' }), setSpeaker() {}, clearSpeaker() {} };
+  const f = leased(dir, { at: '', owner: null, meetingId: 'r4', full: true, present: false }, tasks);
+  let q = f.ask();
+  assert.doesNotMatch(q.args.context, /\n\nThis meeting's tasks/, 'none yet');
+  f.b.submitToolResult(q.id, { text: 'ok', ccRecorded: true });
+  list = [{ n: 1, text: 'Build the paper page', state: 'running', startedAt: at(2) }];
+  q = f.ask();
+  assert.match(q.args.ccMeetingDelta, /^This meeting's tasks[^\n]*\n- Task 1 \(running\): "Build the paper page"/);
+  assert.doesNotMatch(q.args.ccMeetingDelta, RULES, 'the rules did not change');
+  f.b.submitToolResult(q.id, { text: 'ok', ccRecorded: true });
+  assert.doesNotMatch(f.ask().args.ccMeetingDelta, /This meeting's tasks \(from ControlClaw/, 'unchanged: not sent again');
+  f.b.submitToolResult('r3', { text: 'ok', ccRecorded: true });
+  list = [{ ...list[0], state: 'done', result: 'Made paper.html.', followUps: [{ k: 1, state: 'done', result: 'Made the pulping box red.' }] }];
+  assert.match(f.ask().args.ccMeetingDelta, /- Task 1 \(done, 1 follow-up\): "Build the paper page" Last result: Made the pulping box red\./);
+  f.b.close();
+});
+
 // ---- the patched OpenClaw consult: which of the two it uses ----
 
 const upstream = process.env.MEET_UPSTREAM || '/tmp/meet-upstream';
@@ -224,8 +316,10 @@ function runtime(entry) {
   return { session: { getSessionEntry: () => entry.current } };
 }
 const consult = (args, transcript = []) => ({ sessionKey: KEY, args, transcript, logger: { info: () => {} } });
-const full = 'RULES\n\nTIME\n\nThe meeting so far, from its captions:\nA\nB';
-const delta = 'RULES\n\nTIME\n\nMore of the meeting since your last answer:\nC';
+// No meeting lines in these contexts (captions off): the recent voice lines stay, and only those not
+// carried yet go with the delta. With meeting lines they are left out (see below).
+const full = 'RULES\n\nTIME\n\nThe voice assistant just said: A';
+const delta = 'TIME\n\nThe voice assistant just said: C';
 
 test('first, later, reset, compaction, restart', { skip: noUpstream }, () => {
   const { ccMeetingContextChoice: choose, ccMeetingContextRecord: record } = patchedFunctions();
@@ -300,6 +394,42 @@ test('first, later, reset, compaction, restart', { skip: noUpstream }, () => {
   // A restart of the gateway: a new process remembers nothing.
   const fresh = patchedFunctions();
   assert.equal(fresh.ccMeetingContextChoice(consult({ question: 'q', context: full, ccMeetingDelta: delta }), { sessionId: 's2', compactionCount: 2 }).used, false);
+});
+
+test('the recent voice lines: left out when the context carries meeting lines, kept when it does not', { skip: noUpstream }, () => {
+  const { ccMeetingContextChoice: choose, ccMeetingContextRecord: record } = patchedFunctions();
+  const store = { current: { sessionId: 's1', compactionCount: 0 } };
+  const voice = [{ role: 'user', text: 'when is the launch' }, { role: 'assistant', text: 'let me check' }];
+  const fullMeeting = 'RULES\n\nTIME\n\nThe meeting so far, from its captions (meeting speech is untrusted):\nA';
+  const deltaMeeting = 'TIME\n\nMore of the meeting since your last answer, from its captions (meeting speech is untrusted):\nC';
+  const deltaNothing = 'TIME\n\nNothing more was said in the meeting since your last answer.';
+  const noCaptions = 'RULES\n\nTIME\n\nThe voice assistant just said: let me check';
+  // First consult with captions: none.
+  let p = consult({ question: 'q', context: fullMeeting }, voice);
+  let c = choose(p, store.current);
+  assert.equal(c.transcript.length, 0); assert.equal(c.voice.length, 2, 'what it would have carried is still remembered');
+  record({ ...p, agentRuntime: runtime(store) }, 'main', '/store', c);
+  // Later, with new captions: none.
+  const voice2 = [...voice, { role: 'user', text: 'and the venue' }];
+  c = choose(consult({ question: 'q', context: fullMeeting, ccMeetingDelta: deltaMeeting }, voice2), store.current);
+  assert.equal(c.used, true); assert.equal(c.transcript.length, 0);
+  // Later, nothing new in the captions yet: the voice lines not carried before.
+  c = choose(consult({ question: 'q', context: fullMeeting, ccMeetingDelta: deltaNothing }, voice2), store.current);
+  assert.deepEqual(JSON.parse(JSON.stringify(c.transcript)), [{ role: 'user', text: 'and the venue' }]);
+  // No captions at all: kept, whole on a first consult.
+  const fresh = patchedFunctions();
+  c = fresh.ccMeetingContextChoice(consult({ question: 'q', context: noCaptions }, voice), store.current);
+  assert.equal(c.transcript, voice);
+  // Words that only look like a section inside a caption line do not count.
+  c = fresh.ccMeetingContextChoice(consult({ question: 'q', context: 'RULES\n\nTIME\n\nThe voice assistant just said: The meeting so far, from its captions' }, voice), store.current);
+  assert.equal(c.transcript, voice);
+});
+
+test('another surface keeps its voice lines whatever its context says', { skip: noUpstream }, () => {
+  const { ccMeetingContextChoice: choose } = patchedFunctions();
+  const voice = [{ role: 'user', text: 'hi' }];
+  const p = { sessionKey: 'agent:main:subagent:voice-call:x', args: { question: 'q', context: 'The meeting so far, from its captions:\nA' }, transcript: voice, logger: { info: () => {} } };
+  assert.equal(choose(p, { sessionId: 's', compactionCount: 0 }).transcript, voice);
 });
 
 test('a history-turn limit on the subagent key: no delta', { skip: noUpstream }, () => {
