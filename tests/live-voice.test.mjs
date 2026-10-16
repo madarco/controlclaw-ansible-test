@@ -251,3 +251,15 @@ test('phone: a lookup is acknowledged too',t=>{
  f.bridge.event({type:'session.delegation.created',delegation:{id:'p1'}});t.mock.timers.tick(300);
  assert.equal(acks(f).length,1);f.bridge.close();
 });
+test('acknowledged when the request turns out addressed after the delegation; a repeat in a noisy room is not acknowledged twice',t=>{
+ t.mock.timers.enable({apis:['setTimeout','Date'],now:5_000_000});
+ const f=fixture('meeting',LiveBridge,{enabled:true,words:['ControlClaw']});
+ f.bridge.event({type:'session.delegation.created',delegation:{id:'d1'}});
+ said(f,'user','ControlClaw, what is the snack?');t.mock.timers.tick(300);
+ assert.equal(acks(f).length,1,'the name came with the late transcript');
+ // Others talk on; the model asks again for the same words two seconds later.
+ for(let i=0;i<20;i++){f.bridge.sendAudio(loud);t.mock.timers.tick(100);}
+ f.bridge.event({type:'session.delegation.created',delegation:{id:'d2'}});t.mock.timers.tick(5000);
+ assert.equal(acks(f).length,1);
+ f.bridge.close();
+});

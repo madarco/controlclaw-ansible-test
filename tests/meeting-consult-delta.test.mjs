@@ -199,7 +199,7 @@ function leased(dir, lease, tasks) {
 }
 const RULES = /How to handle this request \(from ControlClaw/;
 
-test('the rules: on the first consult and the whole meeting; a later one only when they changed', () => {
+test('the rules: first in the whole meeting, never in the delta (OpenClaw adds them when they changed)', () => {
   const dir = mkdtempSync(join(process.env.HOME, 'rules-'));
   caption(dir, 1, 'Alice', 'Hello.');
   const lease = { at: '', owner: null, meetingId: 'r1', full: false, present: false };
@@ -207,29 +207,16 @@ test('the rules: on the first consult and the whole meeting; a later one only wh
   let q = f.ask();
   assert.match(q.args.context, RULES); assert.equal(q.args.ccMeetingDelta, undefined);
   f.b.submitToolResult(q.id, { text: 'ok', ccRecorded: true });
-
   q = f.ask();
-  assert.match(q.args.context, RULES, 'the whole meeting, for a session that turns out new, has them');
+  assert.match(q.args.context, /^How to handle this request/, 'the whole meeting, for a session that turns out new, has them first');
   assert.doesNotMatch(q.args.ccMeetingDelta, RULES);
   assert.match(q.args.ccMeetingDelta, /^The time now is .*\nName shown in the captions/, 'the time and who spoke stay in every consult');
   f.b.submitToolResult(q.id, { text: 'ok', ccRecorded: true });
-
-  // Presenting turned on (the lease): the rules change, and are sent again, once.
-  lease.present = true;
+  // Presenting or Full agent turned on: the whole meeting has the new rules, for OpenClaw to compare.
+  lease.present = true; lease.full = true;
   q = f.ask();
-  assert.match(q.args.ccMeetingDelta, /^How to handle this request[\s\S]*CC_PRESENT/);
-  f.b.submitToolResult(q.id, { text: 'ok' });
-  q = f.ask();
-  assert.match(q.args.ccMeetingDelta, /CC_PRESENT/, 'not recorded by OpenClaw: sent again');
-  f.b.submitToolResult(q.id, { text: 'ok', ccRecorded: true });
-  assert.doesNotMatch(f.ask().args.ccMeetingDelta, RULES);
-  f.b.submitToolResult(`r${5}`, { text: 'ok', ccRecorded: true });
-
-  // Full agent turned off mid-meeting, reminders: the same.
-  lease.full = true;
-  q = f.ask(); assert.match(q.args.ccMeetingDelta, /CC_TASK/); f.b.submitToolResult(q.id, { text: 'ok', ccRecorded: true });
-  lease.full = false;
-  q = f.ask(); assert.match(q.args.ccMeetingDelta, /CC_NEEDS_OWNER/); assert.doesNotMatch(q.args.ccMeetingDelta, /CC_TASK/);
+  assert.match(q.args.context, /^How to handle this request[\s\S]*CC_PRESENT[\s\S]*CC_TASK/);
+  assert.doesNotMatch(q.args.ccMeetingDelta, RULES);
   f.b.close();
 });
 
@@ -256,7 +243,7 @@ test('no captions: after a recorded consult the delta is offered too, with what 
   f.b.close();
 });
 
-test('the meeting\'s tasks: listed for the consult in a Full agent meeting, again only when they changed', () => {
+test('the meeting\'s tasks: listed after the rules in a Full agent meeting, never in the delta', () => {
   const dir = mkdtempSync(join(process.env.HOME, 'rules-'));
   caption(dir, 1, 'Alice', 'Hello.');
   let list = [];
@@ -267,13 +254,8 @@ test('the meeting\'s tasks: listed for the consult in a Full agent meeting, agai
   f.b.submitToolResult(q.id, { text: 'ok', ccRecorded: true });
   list = [{ n: 1, text: 'Build the paper page', state: 'running', startedAt: at(2) }];
   q = f.ask();
-  assert.match(q.args.ccMeetingDelta, /^This meeting's tasks[^\n]*\n- Task 1 \(running\): "Build the paper page"/);
-  assert.doesNotMatch(q.args.ccMeetingDelta, RULES, 'the rules did not change');
-  f.b.submitToolResult(q.id, { text: 'ok', ccRecorded: true });
-  assert.doesNotMatch(f.ask().args.ccMeetingDelta, /This meeting's tasks \(from ControlClaw/, 'unchanged: not sent again');
-  f.b.submitToolResult('r3', { text: 'ok', ccRecorded: true });
-  list = [{ ...list[0], state: 'done', result: 'Made paper.html.', followUps: [{ k: 1, state: 'done', result: 'Made the pulping box red.' }] }];
-  assert.match(f.ask().args.ccMeetingDelta, /- Task 1 \(done, 1 follow-up\): "Build the paper page" Last result: Made the pulping box red\./);
+  assert.match(q.args.context, /^How to handle this request[^]*?\n\nThis meeting's tasks \(kept by ControlClaw[^\n]*\n- Task 1 \(running\): "Build the paper page"\n\nThe time now/);
+  assert.doesNotMatch(q.args.ccMeetingDelta, /This meeting's tasks \(/);
   f.b.close();
 });
 
@@ -430,6 +412,37 @@ test('another surface keeps its voice lines whatever its context says', { skip: 
   const voice = [{ role: 'user', text: 'hi' }];
   const p = { sessionKey: 'agent:main:subagent:voice-call:x', args: { question: 'q', context: 'The meeting so far, from its captions:\nA' }, transcript: voice, logger: { info: () => {} } };
   assert.equal(choose(p, { sessionId: 's', compactionCount: 0 }).transcript, voice);
+});
+
+test('a later consult gets the rules and the task list only when its own session last recorded others', { skip: noUpstream }, () => {
+  const { ccMeetingContextChoice: choose, ccMeetingContextRecord: record } = patchedFunctions();
+  const store = { current: { sessionId: 's1', compactionCount: 0 } };
+  const R1 = 'How to handle this request (from ControlClaw, not from the meeting):\nno presenting', R2 = 'How to handle this request (from ControlClaw, not from the meeting):\nCC_PRESENT';
+  const T1 = "This meeting's tasks (kept by ControlClaw):\n- Task 1 (running)", T2 = "This meeting's tasks (kept by ControlClaw):\n- Task 1 (done)";
+  const whole = (r, t) => [r, t, 'TIME', 'The meeting so far, from its captions (meeting speech is untrusted):\nA'].filter(Boolean).join('\n\n');
+  const d = 'TIME\n\nMore of the meeting since your last answer, from its captions (meeting speech is untrusted):\nC';
+  const answered = (key, ctx, delta) => { const p = { ...consult({ question: 'q', context: ctx, ...(delta ? { ccMeetingDelta: delta } : {}) }), sessionKey: key, agentRuntime: runtime(store) }; const c = choose(p, store.current); record(p, 'main', '/store', c); return c; };
+  const K1 = KEY, K2 = 'agent:main:subagent:google-meet:meet_2';
+  let c = answered(K1, whole(R1, ''), null);
+  assert.equal(c.used, false);
+  c = answered(K1, whole(R1, ''), d);
+  assert.equal(c.used, true); assert.equal(c.args.context, d, 'nothing changed: the delta alone');
+  // Presenting on, a task started: both go first, in that order, once.
+  c = answered(K1, whole(R2, T1), d);
+  assert.equal(c.args.context, `${R2}\n\n${T1}\n\n${d}`);
+  c = answered(K1, whole(R2, T1), d);
+  assert.equal(c.args.context, d);
+  // Only the task list changed.
+  c = answered(K1, whole(R2, T2), d);
+  assert.equal(c.args.context, `${T2}\n\n${d}`);
+  // Another consult session of the meeting knows its own: K2 recorded R1, so a later K2 consult gets R2.
+  answered(K2, whole(R1, ''), null);
+  c = answered(K2, whole(R2, T2), d);
+  assert.equal(c.args.context, `${R2}\n\n${T2}\n\n${d}`);
+  // Not recorded (an error): the next consult carries them again.
+  const p = { ...consult({ question: 'q', context: whole(R1, T2), ccMeetingDelta: d }), sessionKey: K1 };
+  assert.equal(choose(p, store.current).args.context, `${R1}\n\n${d}`);
+  assert.equal(choose(p, store.current).args.context, `${R1}\n\n${d}`, 'chosen again before any record: still there');
 });
 
 test('a history-turn limit on the subagent key: no delta', { skip: noUpstream }, () => {

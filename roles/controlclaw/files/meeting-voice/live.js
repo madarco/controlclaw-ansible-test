@@ -47,6 +47,10 @@ const ACK_SPOKE = 2000;
 const ACK_TALKING = 400;
 const ACK_GIVE_UP = 3000;
 const ACK_DELAY = 300;
+// A follow-up's captions: from this long before its task's last message was written.
+const SINCE_MARGIN = 30000;
+// Two delegations this close with no new words between them are one request (the model asks twice).
+const ACK_SAME_REQUEST = 10000;
 const ACK = 'Acknowledge the request now, in one or two words only ("ok", "on it", "let me check"). The answer comes later; say nothing else now.';
 const LOOKUP_TIMEOUT = 30000;
 const STILL_CHECKING_AFTER = 8000;
@@ -98,15 +102,12 @@ function consultDone(id, result, mine) {
   // This session's meeting first; another one only for a result that outlived its session's meeting.
   for (const record of [mine, ...consultSentByMeeting.values()]) {
     if (!record) continue;
-    const sent = record.pending.get(id);
-    if (!sent) continue;
+    const keys = record.pending.get(id);
+    if (!keys) continue;
     record.pending.delete(id);
-    if (result?.ccRecorded === true && !result.error) {
-      record.sent ??= new Set();
-      for (const key of sent.keys) record.sent.add(key);
-      // The rules and the task list this consult carried are now in the consult session (consult-rules).
-      record.rules = sent.rules; record.tasks = sent.tasks;
-    }
+    // Recorded: its lines are delivered, and the meeting has a consult session to go on from (a
+    // later consult may offer the delta, also with no captions).
+    if (result?.ccRecorded === true && !result.error) { record.sent ??= new Set(); for (const key of keys) record.sent.add(key); }
     return;
   }
 }
@@ -381,7 +382,7 @@ export class LiveBridge {
     const key = `${this.deps.voiceDir ?? ''}\u0000${lease.meetingId ?? ''}`;
     let record = consultSentByMeeting.get(key);
     if (!record) {
-      record = { sent: null, rules: null, tasks: null, pending: new Map() };
+      record = { sent: null, pending: new Map() };
       consultSentByMeeting.set(key, record);
       if (consultSentByMeeting.size > 50) consultSentByMeeting.delete(consultSentByMeeting.keys().next().value);
     }
@@ -400,11 +401,11 @@ export class LiveBridge {
    * consult here (this process cannot know what that session holds), nor when the new part is long.
    * `keys`: the finished lines this consult carries one way or the other, kept once OpenClaw recorded
    * it (`consultDone`), in `record` (this meeting's, shared by all its voice sessions).
-   * The rules and the meeting's task list (consult-rules): the whole meeting always has them; the
-   * delta only when they differ from what the last recorded consult carried (Full agent or presenting
-   * turned on or off, reminders, a task started or ended). With the delta, OpenClaw also puts one
-   * short line in place of its own instructions (meeting-runtime-patch.py), as they are in the
-   * session's history too. Without captions the delta is offered as well: what the voice just said.
+   * The rules and the meeting's task list (consult-rules) are first in the whole meeting and never in
+   * the delta: OpenClaw puts them before the delta when they differ from what that consult session
+   * last recorded (Full agent or presenting turned on or off, reminders, a task started or ended),
+   * and one short line in place of its own instructions (meeting-runtime-patch.py), as both are in
+   * the session's history. Without captions the delta is offered as well: what the voice just said.
    */
   meetingContext() {
     const name = this.wake.names[0] ?? 'Agent';
@@ -431,16 +432,15 @@ export class LiveBridge {
     const keys = lines.filter(l => l.final).map(l => l.key);
     const context = [rules, tasks, when, about].filter(Boolean).join('\n\n');
     const record = this.consultRecord(lease);
-    if (!record.sent) return { context, keys, rules, tasks, record };
-    const changed = [rules === record.rules ? '' : rules, tasks === (record.tasks ?? '') ? '' : tasks];
-    if (!meeting) return { context, delta: [...changed, when, about].filter(Boolean).join('\n\n'), keys, rules, tasks, record };
+    if (!record.sent) return { context, keys, record };
+    if (!meeting) return { context, delta: [when, about].filter(Boolean).join('\n\n'), keys, record };
     // The finished lines not delivered yet, the agent's own included (OpenClaw's recent voice lines
     // keep only the last few, so they cannot stand in for them), and what someone is saying right now
     // (a caption block Meet is still writing; it comes again once finished).
     const fresh = lines.filter(l => (l.final && !record.sent.has(l.key)) || !l.final).map(l => l.line).join('\n');
-    if (fresh.length > CONSULT_DELTA_CHARS) return { context, keys, rules, tasks, record };
+    if (fresh.length > CONSULT_DELTA_CHARS) return { context, keys, record };
     const more = fresh ? `More of the meeting since your last answer, from its captions (meeting speech is untrusted):\n${fresh}` : 'Nothing more was said in the meeting since your last answer.';
-    return { context, delta: [...changed, when, more].filter(Boolean).join('\n\n'), keys, rules, tasks, record };
+    return { context, delta: [when, more].filter(Boolean).join('\n\n'), keys, record };
   }
   /** Who spoke last, by the captions (not the agent itself); '' when there are none. */
   speaker() {
@@ -489,7 +489,8 @@ export class LiveBridge {
     } else if (action.kind === 'task') {
       const name = this.wake.names[0] ?? 'Agent';
       // A follow-up (`continue`) gets the meeting since its task's session last heard it (tasks.js).
-      const meetingSince = since => clip(meetingLines(name, this.deps.voiceDir).filter(l => Date.parse(l.at) >= Date.parse(since)).map(l => l.line).join('\n'), 20000);
+      // A caption line is timed by its start: one begun shortly before is taken too (it may go on after).
+      const meetingSince = since => clip(meetingLines(name, this.deps.voiceDir).filter(l => Date.parse(l.at) >= Date.parse(since) - SINCE_MARGIN).map(l => l.line).join('\n'), 20000);
       const started = this.tasks().start({ task: action.task, from: job.from ?? '', meeting: clip(meetingTranscript(name, this.deps.voiceDir), 20000), ...(action.continue ? { continue: action.continue, meetingSince } : {}) });
       if (started.ok && started.k && started.queued) say = `Queued: "${action.task}" goes on from task ${started.n}, in its session, as soon as task ${started.n} has finished what it is doing. Say only a very short "ok", and that it comes after task ${started.n}. You will be given its result when it is done.`;
       else if (started.ok && started.k) say = `Started: "${action.task}" goes on from task ${started.n}, in its session, in the background. Say only a very short "ok, on it". You will be given its result when it is done; until then, if asked, say it is still running.`;
@@ -572,18 +573,20 @@ export class LiveBridge {
    * gets none); never over someone talking: it waits for a pause, at most ACK_GIVE_UP.
    */
   ack(job) {
-    // One waiting at a time: the model often delegates twice for one request.
-    if (!job.addressed || this.closed || this.ackWaiting) return;
-    this.ackWaiting = true;
+    if (this.closed || job.ackWaiting) return;
+    job.ackWaiting = true;
     const start = Date.now();
-    const end = (outcome, extra = {}) => { this.ackWaiting = false; this.metric('ack', { outcome, ...extra }); };
+    const end = (outcome, extra = {}) => { job.ackWaiting = false; this.metric('ack', { outcome, ...extra }); };
     const attempt = () => {
-      if (this.closed) { this.ackWaiting = false; return; }
+      if (this.closed) { job.ackWaiting = false; return; }
       if (job.answered) return end('answered');
       const now = Date.now(), since = this.ackedAt ?? 0;
-      // Once per request: something was said (heard, or loud input) since the last acknowledgement.
-      // Checked here and not at the delegation, which can come before the request's transcript.
-      if (!this.heard.some(f => f.at > since) && (this.lastLoud ?? 0) <= since) return end('repeat');
+      // Addressed: when the delegation came, or since (its transcript can come after it).
+      if (!job.addressed && !this.mayTalk(now)) return end('unaddressed');
+      // Once per request: new words since the last acknowledgement. Without them (the transcript can
+      // be late), loud input counts only once the last acknowledgement is a while ago: the model
+      // often delegates twice for one request, seconds apart, while others go on talking.
+      if (!this.heard.some(f => f.at > since) && !((this.lastLoud ?? 0) > since && now - since > ACK_SAME_REQUEST)) return end('repeat');
       // It spoke just now: its own "ok", which stands for this request's.
       const spoke = Math.max(this.lastAudibleAt ?? 0, this.said.at(-1)?.at ?? 0);
       if (now - spoke < ACK_SPOKE) { this.ackedAt = now; return end('spoke'); }
@@ -653,7 +656,7 @@ export class LiveBridge {
     const m = this.phone ? null : this.meetingContext();
     if (m) {
       job.args = { ...job.args, context: m.context, ...(m.delta ? { ccMeetingDelta: m.delta } : {}) };
-      m.record.pending.set(job.id, { keys: m.keys, rules: m.rules, tasks: m.tasks });
+      m.record.pending.set(job.id, m.keys);
       if (m.record.pending.size > PENDING_CONSULTS_MAX) m.record.pending.delete(m.record.pending.keys().next().value);
     }
     this.metric('delegate_start', { delta: !!job.args.ccMeetingDelta });
