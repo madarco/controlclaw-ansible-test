@@ -1,0 +1,24 @@
+---
+# The organization's brain on GPT models that run on the Codex harness: the helper the vm-agent runs
+# when the agent is connected to the brain or disconnected from it (files/cc-codex-direct says why
+# it writes Codex's managed config). Inert on an agent that is not connected: the file is only
+# written while it is.
+- name: Codex | cc-codex-direct (root-owned, on, off or status)
+  ansible.builtin.copy:
+    src: cc-codex-direct
+    dest: /usr/local/bin/cc-codex-direct
+    owner: root
+    group: root
+    mode: '0755'
+
+- name: Codex | Let the agent's user run the helper
+  ansible.builtin.copy:
+    dest: /etc/sudoers.d/controlclaw-codex
+    owner: root
+    group: root
+    mode: '0440'
+    validate: /usr/sbin/visudo -cf %s
+    content: |
+      {{ controlclaw_user }} ALL=(root) NOPASSWD: /usr/local/bin/cc-codex-direct on
+      {{ controlclaw_user }} ALL=(root) NOPASSWD: /usr/local/bin/cc-codex-direct off
+      {{ controlclaw_user }} ALL=(root) NOPASSWD: /usr/local/bin/cc-codex-direct status

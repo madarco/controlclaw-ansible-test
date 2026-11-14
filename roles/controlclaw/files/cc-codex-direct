@@ -1,0 +1,67 @@
+#!/bin/bash
+# cc-codex-direct: list the organization's brain tools to GPT models on the Codex harness, or stop.
+#
+#   cc-codex-direct on     write /etc/codex/managed_config.toml
+#   cc-codex-direct off    remove it
+#   cc-codex-direct status print "on" or "off"
+#
+# Why (controlclaw apps/saas/docs/features/brain.md, "GPT models on the Codex harness"): Codex marks
+# current GPT models code-mode-only, so an MCP server's tools are not in the model's tool list; they
+# are reachable only inside `exec`. `features.code_mode.direct_only_tool_namespaces` lists a
+# namespace's tools directly. OpenClaw sends its own list (`openclaw_direct`) with every thread, as a
+# session override, and an override's array replaces the one in the agent's codex-home config.toml
+# (checked on Codex 0.160.0, 14 November 2026). The legacy managed config is the one layer Codex
+# reads above session overrides, so the entry goes here, with OpenClaw's namespace kept in it.
+#
+# The vm-agent runs this, by a sudoers line, when the agent is connected to the brain or
+# disconnected from it. It takes no other argument and writes one fixed file, so the agent's user
+# can turn the brain's tools on or off in the list and nothing else.
+set -euo pipefail
+
+FILE=/etc/codex/managed_config.toml
+MARK="# Managed by ControlClaw (cc-codex-direct)."
+
+ours() {
+  [ -f "$FILE" ] && head -n1 "$FILE" | grep -qxF "$MARK"
+}
+
+case "${1:-}" in
+  on)
+    install -d -o root -g root -m 0755 /etc/codex
+    if [ -e "$FILE" ] && ! ours; then
+      echo "cc-codex-direct: $FILE is not ours; left as it is" >&2
+      exit 1
+    fi
+    tmp="$(mktemp /etc/codex/.managed_config.XXXXXX)"
+    cat > "$tmp" <<TOML
+$MARK
+# The brain's tools (mcp__gbrain) are listed directly; openclaw_direct is OpenClaw's own entry,
+# which this layer would otherwise replace.
+[features.code_mode]
+direct_only_tool_namespaces = ["openclaw_direct", "mcp__gbrain"]
+TOML
+    chmod 0644 "$tmp"
+    if ours && cmp -s "$tmp" "$FILE"; then
+      rm -f "$tmp"
+      echo unchanged
+    else
+      mv "$tmp" "$FILE"
+      echo changed
+    fi
+    ;;
+  off)
+    if ours; then
+      rm -f "$FILE"
+      echo changed
+    else
+      echo unchanged
+    fi
+    ;;
+  status)
+    if ours; then echo on; else echo off; fi
+    ;;
+  *)
+    echo "usage: cc-codex-direct on|off|status" >&2
+    exit 2
+    ;;
+esac

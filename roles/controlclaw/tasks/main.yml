@@ -318,6 +318,10 @@
   ansible.builtin.include_tasks: shared-notes.yml
   when: vm_id is defined and box_role == 'openclaw'
 
+- name: Include the brain's tools on the Codex harness (cc-codex-direct)
+  ansible.builtin.include_tasks: codex-direct.yml
+  when: box_role == 'openclaw'
+
 - name: Include Caddy (TLS termination + auth shim in front of OpenClaw)
   ansible.builtin.include_tasks: caddy.yml
   # Firewall boxes too, since inbound webhooks arrive there and need a real certificate for the
