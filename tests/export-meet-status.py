@@ -23,7 +23,8 @@ with tempfile.TemporaryDirectory() as d:
         patcher.patch(dest / 'host', dest / 'plugin')
     if len(sys.argv) > 2 and sys.argv[2] == 'backend':
         # 2026.11.5 moved it to its own module (meeting-config), with minified parameter names.
-        source = next((dest / 'host/dist').glob('meeting-config-????????.mjs')).read_text()
+        [config] = (dest / 'host/dist').glob('meeting-config-????????.mjs')
+        source = config.read_text()
         start = re.search(r'async function ensureMeetingAudioBackend\(\w+\) \{', source).start()
         print(source[start:source.index('\n}', start)+2])
         print('; ensureMeetingAudioBackend')

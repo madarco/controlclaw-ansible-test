@@ -288,8 +288,11 @@ function patchedFunctions() {
 
 test('the patched prompt is built from the choice, and the record follows an answered consult', { skip: noUpstream }, () => {
   assert.match(patched, /args: ccMeetingContext\.args,\n\t+transcript: ccMeetingContext\.transcript,/);
-  // 2026.11.5's names are minified: the consult's params, agent id, store path and run result.
-  assert.match(patched, /assertRealtimeVoiceConsultNotInterrupted\(\w+, \w+\.meta\);\n\t+const ccRecorded = ccMeetingContextRecord\(\w+, \w+, \w+, ccMeetingContext\) \? \{ ccRecorded: true \} : \{\};/);
+  // 2026.11.5's names are minified: the run's abort signal v and result b; the consult's params e,
+  // agent id r and store path i (reviewed against the pinned build).
+  assert.match(patched, /assertRealtimeVoiceConsultNotInterrupted\(v, b\.meta\);\n\t+const ccRecorded = ccMeetingContextRecord\(e, r, i, ccMeetingContext\) \? \{ ccRecorded: true \} : \{\};/);
+  assert.match(patched, /\tconst r = e\.agentId \?\? resolveSessionAgentId\(\{/);
+  assert.match(patched, /\tconst i = e\.storePath \?\? e\.agentRuntime\.session\.resolveStorePath\(/);
   // Every answer of the run says whether it was recorded.
   assert.equal(patched.match(/\.\.\.ccRecorded\n/g)?.length, 3);
 });
