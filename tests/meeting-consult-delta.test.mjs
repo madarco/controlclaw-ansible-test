@@ -280,7 +280,7 @@ with tempfile.TemporaryDirectory() as d:
 
 function patchedFunctions() {
   const start = patched.indexOf('/** ControlClaw (consult-delta)');
-  const end = patched.indexOf('async function consultRealtimeVoiceAgent(params) {');
+  const end = patched.search(/async function consultRealtimeVoiceAgent\(\w+\) \{/);
   assert.ok(start > 0 && end > start, 'the patched helpers are in the file');
   // A fresh copy of the helpers: a fresh process, with nothing remembered.
   return runInNewContext(`${patched.slice(start, end)}; ({ ccMeetingContextChoice, ccMeetingContextRecord })`, {});
@@ -288,7 +288,8 @@ function patchedFunctions() {
 
 test('the patched prompt is built from the choice, and the record follows an answered consult', { skip: noUpstream }, () => {
   assert.match(patched, /args: ccMeetingContext\.args,\n\t+transcript: ccMeetingContext\.transcript,/);
-  assert.match(patched, /assertRealtimeVoiceConsultNotInterrupted\(abortSignal, result\.meta\);\n\t+const ccRecorded = ccMeetingContextRecord\(params, agentId, storePath, ccMeetingContext\) \? \{ ccRecorded: true \} : \{\};/);
+  // 2026.11.5's names are minified: the consult's params, agent id, store path and run result.
+  assert.match(patched, /assertRealtimeVoiceConsultNotInterrupted\(\w+, \w+\.meta\);\n\t+const ccRecorded = ccMeetingContextRecord\(\w+, \w+, \w+, ccMeetingContext\) \? \{ ccRecorded: true \} : \{\};/);
   // Every answer of the run says whether it was recorded.
   assert.equal(patched.match(/\.\.\.ccRecorded\n/g)?.length, 3);
 });
