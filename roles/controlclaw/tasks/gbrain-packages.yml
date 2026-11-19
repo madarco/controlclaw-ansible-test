@@ -168,8 +168,9 @@
       num() { case "$1" in ''|*[!0-9]*) echo 0 ;; *) echo "$1" ;; esac; }
       started="$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)"
 
-      # 1. Facts. Waiting and running jobs only: a job waiting out a retry delay is the next night's.
-      queued() { num "$(sql "select count(*) from minion_jobs where queue = 'default' and status in ('waiting', 'active')")"; }
+      # 1. Facts. Jobs waiting, running, or due within two minutes (GBrain defers the whole queue for a
+      #    short while after a provider error); one deferred for longer is the next night's.
+      queued() { num "$(sql "select count(*) from minion_jobs where queue = 'default' and (status in ('waiting', 'active') or (status = 'delayed' and delay_until <= now() + interval '2 minutes'))")"; }
       if [ "$(queued)" -gt 0 ]; then
         "$G" jobs work --concurrency 2 --nice 10 >/dev/null 2>&1 &
         worker=$!
