@@ -167,9 +167,6 @@
       sql() { psql "$GBRAIN_DATABASE_URL" -Atc "$1" 2>/dev/null; }
       num() { case "$1" in ''|*[!0-9]*) echo 0 ;; *) echo "$1" ;; esac; }
       started="$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)"
-      facts_before="$(num "$(sql "select count(*) from facts")")"
-      atoms_sql="select count(*) from pages where type = 'atom' and deleted_at is null"
-      atoms_before="$(num "$(sql "$atoms_sql")")"
 
       # 1. Facts. Waiting and running jobs only: a job waiting out a retry delay is the next night's.
       queued() { num "$(sql "select count(*) from minion_jobs where queue = 'default' and status in ('waiting', 'active')")"; }
@@ -201,13 +198,16 @@
       atoms_rc=$?
 
       finished="$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)"
-      facts_after="$(num "$(sql "select count(*) from facts")")"
-      atoms_after="$(num "$(sql "$atoms_sql")")"
+      # What the night added and retired, by the rows' own times: not a difference of totals, which the
+      # cycle's own merging would eat into.
+      facts_new="$(num "$(sql "select count(*) from facts where created_at >= '$started'::timestamptz")")"
+      facts_retired="$(num "$(sql "select count(*) from facts where expired_at >= '$started'::timestamptz")")"
+      atoms_new="$(num "$(sql "select count(*) from pages where type = 'atom' and deleted_at is null and created_at >= '$started'::timestamptz")")"
       usage="$(sql "select coalesce(sum(cost_usd),0)||' '||count(*) from chat_usage_log where created_at >= '$started'::timestamptz" || echo "")"
       if [ -d "$REPORT_DIR" ]; then
         tmp="$(mktemp "$REPORT_DIR/.last-cycle.XXXXXX")"
         OUT="$out" RC="$rc" STARTED="$started" FINISHED="$finished" USAGE="$usage" ATOMS="$atoms_out" ATOMS_RC="$atoms_rc" \
-          FACTS_BEFORE="$facts_before" FACTS_AFTER="$facts_after" ATOMS_NEW="$((atoms_after - atoms_before))" CHECKED="$pages_fact_checked" WAITING="$facts_waiting" \
+          FACTS_NEW="$facts_new" FACTS_RETIRED="$facts_retired" ATOMS_NEW="$atoms_new" CHECKED="$pages_fact_checked" WAITING="$facts_waiting" \
           python3 - > "$tmp" <<'PY'
       import json, os
       def load(name):
@@ -229,14 +229,16 @@
                   return p["details"]
           return {}
       # What this run added to GBrain's own totals (counts only).
-      totals["facts_extracted"] = max(0, int(os.environ["FACTS_AFTER"]) - int(os.environ["FACTS_BEFORE"]))
+      totals["facts_extracted"] = int(os.environ["FACTS_NEW"])
       totals["pages_fact_checked"] = int(os.environ["CHECKED"])
       totals["facts_waiting"] = int(os.environ["WAITING"])
       edges = details("edge_contradictions")
       totals["relationships_ended"] = n(edges.get("applied")) + n(edges.get("declared_applied"))
+      # Facts a newer one replaced, and relationships that ended: what the night retired.
+      totals["facts_retired"] = int(os.environ["FACTS_RETIRED"]) + totals["relationships_ended"]
       atoms = load("ATOMS")
       # Short pages cut from long ones, and the long pages still waiting for it.
-      totals["atoms_written"] = max(0, int(os.environ["ATOMS_NEW"]))
+      totals["atoms_written"] = int(os.environ["ATOMS_NEW"])
       totals["pages_to_split"] = n(atoms.get("remaining"))
       print(json.dumps({
           "started_at": os.environ["STARTED"],
