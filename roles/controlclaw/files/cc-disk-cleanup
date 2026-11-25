@@ -39,7 +39,9 @@ log() { echo "cc-disk-cleanup: $*"; }
 installing() {
   systemctl is-active -q cc-reprovision.service 2>/dev/null && return 0
   pgrep -f '(^|/)ansible-(pull|playbook)( |$)' >/dev/null && return 0
-  pgrep -x 'apt|apt-get|dpkg|unattended-upgr|npm' >/dev/null && return 0
+  pgrep -x 'apt|apt-get|dpkg|npm' >/dev/null && return 0
+  # unattended-upgrade itself, not the -shutdown helper that waits all the time under the same name.
+  pgrep -f '^/usr/bin/python3 /usr/bin/unattended-upgrade( |$)' >/dev/null && return 0
   pgrep -f '(^|/)npm(-cli\.js)? (install|i|ci|update)( |$)' >/dev/null && return 0
   local st; st=$(cloud-init status 2>/dev/null | awk '/^status:/{print $2}')
   [ -n "$st" ] && [ "$st" != done ] && [ "$st" != error ] && [ "$st" != disabled ] && return 0
