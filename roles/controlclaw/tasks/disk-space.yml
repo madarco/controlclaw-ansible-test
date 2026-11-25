@@ -138,14 +138,14 @@
       content: |
         [Unit]
         Description=ControlClaw disk cleanup (caches only; see /usr/local/bin/cc-disk-cleanup)
-        ConditionPathExists=/usr/local/bin/cc-disk-cleanup
 
         [Service]
         Type=oneshot
         ExecStart=/usr/local/bin/cc-disk-cleanup
+        # Lowest priority that still makes progress on a busy box (the idle classes can starve it).
         Nice=19
-        IOSchedulingClass=idle
-        CPUSchedulingPolicy=idle
+        IOSchedulingClass=best-effort
+        IOSchedulingPriority=7
         TimeoutStartSec=30min
     - name: cc-disk-cleanup.timer
       content: |

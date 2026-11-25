@@ -23,11 +23,16 @@ def test_never_touches_the_container_or_openclaw_state():
         assert forbidden not in code, forbidden
 
 
-def test_chrome_caches_only_when_chrome_is_stopped_and_never_service_workers():
+def test_leaves_chrome_apt_lists_and_the_rollback_copy():
     code = body()
-    assert re.search(r'pgrep -u "\$USER_NAME" -f -- "--user-data-dir=\$profile"', code)
-    assert "-not -path '*/Service Worker/*'" in code
-    assert "CacheStorage" not in code
+    assert ".chrome" not in code and "Service Worker" not in code
+    assert "/var/lib/apt/lists" not in code
+    assert ".cc-openclaw-previous" not in code
+
+
+def test_an_update_stops_a_running_cleanup():
+    reprov = (ROOT / "roles/controlclaw/files/cc-reprovision").read_text()
+    assert "systemctl stop cc-disk-cleanup.service" in reprov
 
 
 def test_connector_image_only_on_a_recorded_agent():
@@ -41,7 +46,7 @@ def test_connector_image_only_on_a_recorded_agent():
 
 def test_low_priority_unit_and_chrome_cache_cap():
     tasks = TASKS.read_text()
-    assert "Nice=19" in tasks and "IOSchedulingClass=idle" in tasks
+    assert "Nice=19" in tasks and "IOSchedulingPriority=7" in tasks
     assert "--disk-cache-size=268435456" in BROWSER.read_text()
 
 
@@ -56,10 +61,10 @@ def test_stands_down_while_an_update_runs(tmp_path):
     bin_.mkdir()
     # systemctl says cc-reprovision is active; anything that would delete must not be reached.
     _stub(bin_, "systemctl", '[ "$*" = "is-active -q cc-reprovision.service" ] && exit 0; exit 1')
-    for tool in ("rm", "docker", "apt-get", "snap", "find"):
+    for tool in ("rm", "docker", "apt-get", "snap", "find", "npm"):
         _stub(bin_, tool, f'echo CALLED-{tool} >&2; exit 99')
     env = dict(os.environ, PATH=f"{bin_}:{os.environ['PATH']}", CC_DISK_CLEANUP_CONF=str(tmp_path / "none"))
     out = subprocess.run(["bash", str(SCRIPT)], env=env, capture_output=True, text=True)
     assert out.returncode == 0
-    assert "skipped: an Update is running" in out.stdout
+    assert "skipped: something is installing" in out.stdout
     assert "CALLED-" not in out.stderr

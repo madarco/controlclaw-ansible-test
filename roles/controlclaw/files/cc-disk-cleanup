@@ -4,16 +4,18 @@
 #
 # Routine, every run: only what costs nothing at the next start or Update.
 #   - core dumps older than 3 days
-#   - an OpenClaw kept for a rollback that no Update is using any more
-#   - dangling Docker images
+#   - dangling Docker images (untagged and unreferenced; an image pulled by digest is neither)
 #   - snaps' disabled revisions
 #   - on an agent, the OpenConnector image (the base image carries it for both roles; only the
 #     firewall runs it, and a firewall's Update pulls it again if it is missing)
 # When the root disk is at LOW_PCT or more, also what only costs a download:
-#   - apt's package cache and lists
+#   - apt's package cache (`apt-get clean`, under apt's own lock; the lists stay, so an Update
+#     that skips `apt update` still finds its packages)
 #   - npm's caches (root's and the agent user's): the next Update downloads again
 #   - Docker's build cache
-#   - Chrome's HTTP, code and GPU caches, only while Chrome is not running (it holds them open)
+# Chrome's cache is not cleaned here: Chrome runs all the time and holds it open, so
+# browser-stream.sh caps it at 256 MB instead. The OpenClaw kept for a rollback is the role's:
+# it is the copy the next run puts back after an Update that was killed.
 #
 # Never touched: anything inside the encrypted container, the agent's workspace, sessions and
 # memory, and the browser profile's cookies, storage, service workers and logins.
@@ -32,11 +34,31 @@ USER_HOME=$(getent passwd "$USER_NAME" | cut -d: -f6)
 
 log() { echo "cc-disk-cleanup: $*"; }
 
-# An Update or a first run is installing: its rollback copy, npm's and apt's files are in use.
-if systemctl is-active -q cc-reprovision.service 2>/dev/null || pgrep -f '(^|/)ansible-(pull|playbook)( |$)' >/dev/null; then
-  log "skipped: an Update is running"
+# Something is installing: an Update (cc-reprovision stops this run when it starts), the first
+# boot, or apt/dpkg/npm run by hand or by a Doctor session. Checked again before each step.
+installing() {
+  systemctl is-active -q cc-reprovision.service 2>/dev/null && return 0
+  pgrep -f '(^|/)ansible-(pull|playbook)( |$)' >/dev/null && return 0
+  pgrep -x 'apt|apt-get|dpkg|unattended-upgr|npm' >/dev/null && return 0
+  pgrep -f '(^|/)npm(-cli\.js)? (install|i|ci|update)( |$)' >/dev/null && return 0
+  local st; st=$(cloud-init status 2>/dev/null | awk '/^status:/{print $2}')
+  [ -n "$st" ] && [ "$st" != done ] && [ "$st" != error ] && [ "$st" != disabled ] && return 0
+  return 1
+}
+stop_if_installing() {
+  installing || return 0
+  if [ -n "${1:-}" ]; then summary "stopped early, something is installing (an Update, apt, dpkg or npm):"
+  else log "skipped: something is installing (an Update, apt, dpkg or npm)"; fi
   exit 0
-fi
+}
+level=routine
+summary() {
+  local after_kib parts="" key
+  after_kib=$(df --output=used -k / | tail -1 | tr -dc 0-9)
+  for key in "${!freed[@]}"; do parts+="${parts:+, }$key $(( freed[$key] / 1024 ))"; done
+  log "${1:+$1 }$level freed $(( (before_kib - after_kib) > 0 ? (before_kib - after_kib) / 1024 : 0 )) MiB${parts:+ ($parts MiB)}; disk ${before_pct}% -> $(used_pct)%"
+}
+stop_if_installing
 exec 9>/run/cc-disk-cleanup.lock
 flock -n 9 || { log "skipped: another run is going"; exit 0; }
 
@@ -63,18 +85,15 @@ before_kib=$(df --output=used -k / | tail -1 | tr -dc 0-9)
 mapfile -t cores < <(find /var/lib/systemd/coredump /var/crash -xdev -type f -mtime +3 2>/dev/null)
 [ ${#cores[@]} -gt 0 ] && drop coredumps "${cores[@]}"
 
-# Kept aside by openclaw.yml for the length of an Update only; an Update that was killed leaves it.
-# No Update is running here (checked above), so the installed OpenClaw is the one that runs.
-if [ -f /usr/lib/node_modules/openclaw/dist/index.js ]; then
-  drop openclaw-previous /usr/lib/.cc-openclaw-previous
-fi
-
+stop_if_installing x
 if docker_ok; then
   k=$(docker image ls -f dangling=true -q | xargs -r docker image inspect --format '{{.Size}}' 2>/dev/null | awk '{s+=$1} END {print int(s/1024)}')
   docker image prune -f >/dev/null 2>&1 && note docker-dangling "${k:-0}"
   if [ "$BOX_ROLE" = openclaw ] && [ -n "${CONNECTOR_IMAGE:-}" ] && [ ! -e /etc/controlclaw/pool-unclaimed ]; then
     ids=$(docker image ls -q "$CONNECTOR_IMAGE" 2>/dev/null | sort -u)
-    if [ -n "$ids" ] && [ -z "$(docker ps -aq --filter "ancestor=$CONNECTOR_IMAGE")" ]; then
+    in_use=""
+    for id in $ids; do in_use+=$(docker ps -aq --filter "ancestor=$id"); done
+    if [ -n "$ids" ] && [ -z "$in_use" ]; then
       k=$(docker image inspect --format '{{.Size}}' $ids 2>/dev/null | awk '{s+=$1} END {print int(s/1024)}')
       docker image rm -f $ids >/dev/null 2>&1 && note connector-image "${k:-0}"
     fi
@@ -89,36 +108,21 @@ if command -v snap >/dev/null; then
 fi
 
 # ---- low disk
-level=routine
 if [ "$(used_pct)" -ge "$LOW_PCT" ]; then
   level=low-disk
-  k=$(kib /var/cache/apt /var/lib/apt/lists)
-  apt-get clean >/dev/null 2>&1
-  find /var/lib/apt/lists -maxdepth 1 -type f ! -name lock -delete 2>/dev/null
-  note apt $(( k - $(kib /var/cache/apt /var/lib/apt/lists) ))
+  stop_if_installing x
+  k=$(kib /var/cache/apt)
+  apt-get clean >/dev/null 2>&1 && note apt "$k"
 
+  stop_if_installing x
   for h in /root "$USER_HOME"; do
     [ -n "$h" ] && [ -d "$h/.npm/_cacache" ] && drop npm "$h/.npm/_cacache"
   done
 
+  stop_if_installing x
   if docker_ok; then
     docker builder prune -af >/dev/null 2>&1
   fi
-
-  profile="$USER_HOME/.chrome"
-  if [ -n "$USER_HOME" ] && [ -d "$profile" ]; then
-    if pgrep -u "$USER_NAME" -f -- "--user-data-dir=$profile" >/dev/null; then
-      log "chrome is running; its caches are left"
-    else
-      mapfile -t caches < <(find "$profile" -maxdepth 3 -type d \( -name Cache -o -name 'Code Cache' -o -name GPUCache \
-        -o -name GrShaderCache -o -name ShaderCache -o -name GraphiteDawnCache -o -name DawnGraphiteCache \
-        -o -name DawnWebGPUCache \) -not -path '*/Service Worker/*' 2>/dev/null)
-      [ ${#caches[@]} -gt 0 ] && drop chrome-cache "${caches[@]}"
-    fi
-  fi
 fi
 
-after_kib=$(df --output=used -k / | tail -1 | tr -dc 0-9)
-parts=""
-for key in "${!freed[@]}"; do parts+="${parts:+, }$key $(( freed[$key] / 1024 ))"; done
-log "$level freed $(( (before_kib - after_kib) > 0 ? (before_kib - after_kib) / 1024 : 0 )) MiB${parts:+ ($parts MiB)}; disk ${before_pct}% -> $(used_pct)%"
+summary
